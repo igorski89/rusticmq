@@ -1,0 +1,26 @@
+[package]
+name = "rusticmq"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Rust port of ElasticMQ's SQS-compatible queue service"
+
+[dependencies]
+axum = "0.8"
+base64 = "0.22"
+bigdecimal = "0.4"
+hocon = { version = "0.9", path = "vendor/hocon" }
+rusqlite = { version = "0.38", features = ["bundled"] }
+md-5 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
