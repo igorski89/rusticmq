@@ -1,0 +1,14 @@
+services:
+  rusticmq:
+    build: .
+    ports:
+      - "9324:9324"
+    environment:
+      RUSTICMQ_BASE_URL: http://localhost:9324
+    command: ["--database", "/data/rusticmq.sqlite"]
+    volumes:
+      - queues:/data
+    stop_grace_period: 30s
+
+volumes:
+  queues:

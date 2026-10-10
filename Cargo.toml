@@ -24,3 +24,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+
+# The container carries only a static executable, so optimize its size separately
+# from normal release builds.
+[profile.container]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
