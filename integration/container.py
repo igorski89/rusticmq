@@ -57,6 +57,11 @@ class ContainerTests(unittest.TestCase):
                     self.assertEqual(client.get_queue_url(QueueName="durable")["QueueUrl"], url)
                     self.assertEqual(client.list_queue_tags(QueueUrl=url)["Tags"], {"runtime": "container"})
                     self.assertFalse(client.receive_message(QueueUrl=url).get("Messages"))
+                    if generation == 2:
+                        attributes = client.get_queue_attributes(QueueUrl=url, AttributeNames=[
+                            "ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible",
+                            "ApproximateNumberOfMessagesDelayed"])["Attributes"]
+                        self.assertEqual(set(attributes.values()), {"0"})
                     if generation == 1:
                         client.delete_message(QueueUrl=url, ReceiptHandle=message["ReceiptHandle"])
                 docker("stop", container)

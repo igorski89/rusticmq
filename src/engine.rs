@@ -37,6 +37,8 @@ struct Queue {
     move_to: Option<QueueRef>,
     dead_letters: Option<QueueRef>,
     messages: BTreeMap<String, Message>,
+    #[serde(skip)]
+    delivery: Option<DeliveryIndex>,
     deduplication: BTreeMap<String, Deduplicated>,
     attempts: BTreeMap<String, ReceiveAttempt>,
     #[serde(skip)]
@@ -45,41 +47,111 @@ struct Queue {
     previous_moves: Vec<MessageMoveTask>,
 }
 
+/// Derived indexes are rebuilt lazily after deserialization; SQLite and engine
+/// snapshots keep messages as the sole source of truth.
+#[derive(Debug, Clone, Default)]
+struct DeliveryIndex {
+    standard: BTreeSet<(Timestamp, u64, String)>,
+    groups: BTreeMap<String, BTreeSet<(Timestamp, u64, String)>>,
+}
+
+impl DeliveryIndex {
+    fn insert(&mut self, message: &Message, fifo: bool) {
+        if fifo {
+            self.groups
+                .entry(message.group_id.clone().expect("FIFO group invariant"))
+                .or_default()
+                .insert((message.created, message.order, message.id.clone()));
+        } else {
+            self.standard
+                .insert((message.next_delivery, message.order, message.id.clone()));
+        }
+    }
+
+    fn remove(&mut self, message: &Message, fifo: bool) {
+        if fifo {
+            let group = message.group_id.as_deref().expect("FIFO group invariant");
+            if let Some(messages) = self.groups.get_mut(group) {
+                messages.remove(&(message.created, message.order, message.id.clone()));
+                if messages.is_empty() {
+                    self.groups.remove(group);
+                }
+            }
+        } else {
+            self.standard
+                .remove(&(message.next_delivery, message.order, message.id.clone()));
+        }
+    }
+}
+
 impl Queue {
-    fn selected(&self, count: usize, now: Timestamp) -> Vec<String> {
-        let mut messages: Vec<_> = self.messages.values().collect();
+    fn ensure_delivery_index(&mut self) {
+        if self.delivery.is_none() {
+            let mut index = DeliveryIndex::default();
+            for message in self.messages.values() {
+                index.insert(message, self.config.fifo);
+            }
+            self.delivery = Some(index);
+        }
+    }
+
+    fn selected(&mut self, count: usize, now: Timestamp) -> Vec<String> {
+        self.ensure_delivery_index();
+        let index = self.delivery.as_ref().expect("delivery index invariant");
         if !self.config.fifo {
-            messages.sort_by_key(|m| (m.next_delivery, m.order));
-            return messages
-                .into_iter()
-                .filter(|m| m.next_delivery <= now)
+            return index
+                .standard
+                .iter()
+                .take_while(|(at, _, _)| *at <= now)
                 .take(count)
-                .map(|m| m.id.clone())
+                .map(|(_, _, id)| id.clone())
                 .collect();
         }
-        // Stay in one group while building a batch. An invisible or delayed head
-        // blocks subsequent messages in its group, including visible successors.
-        let mut groups: BTreeMap<&str, Vec<&Message>> = BTreeMap::new();
-        for message in messages {
-            groups
-                .entry(message.group_id.as_deref().expect("FIFO group invariant"))
-                .or_default()
-                .push(message);
-        }
+        // Preserve upstream lexical group order and contiguous batches. Only a
+        // visible head opens a group; a delayed/in-flight head blocks its tail.
         let mut selected = Vec::new();
-        for group in groups.values_mut() {
-            group.sort_by_key(|m| (m.created, m.order));
-            for message in group {
-                if selected.len() == count || message.next_delivery > now {
+        for group in index.groups.values() {
+            for (_, _, id) in group {
+                if selected.len() == count || self.messages[id].next_delivery > now {
                     break;
                 }
-                selected.push(message.id.clone());
+                selected.push(id.clone());
             }
             if selected.len() == count {
                 break;
             }
         }
         selected
+    }
+
+    fn next_delivery(&mut self) -> Option<Timestamp> {
+        self.ensure_delivery_index();
+        let index = self.delivery.as_ref().expect("delivery index invariant");
+        if self.config.fifo {
+            index
+                .groups
+                .values()
+                .filter_map(|group| group.first())
+                .map(|(_, _, id)| self.messages[id].next_delivery)
+                .min()
+        } else {
+            index.standard.first().map(|(at, _, _)| *at)
+        }
+    }
+
+    fn remove_message(&mut self, id: &str) -> Option<Message> {
+        let message = self.messages.remove(id)?;
+        if let Some(index) = &mut self.delivery {
+            index.remove(&message, self.config.fifo);
+        }
+        Some(message)
+    }
+
+    fn reindex(&mut self, previous: &Message, updated: &Message) {
+        if let Some(index) = &mut self.delivery {
+            index.remove(previous, self.config.fifo);
+            index.insert(updated, self.config.fifo);
+        }
     }
 
     fn refresh_history(&mut self, message: &Message) {
@@ -135,6 +207,7 @@ impl QueueManager {
         }
         validate_queue_name(&request.name, request.fifo, self.relaxed_limits)?;
         let config = request.into_config(now);
+        self.validate_dead_letters(&config)?;
         let copy_to = config
             .copy_messages_to
             .as_deref()
@@ -156,6 +229,7 @@ impl QueueManager {
                 dead_letters,
                 config: config.clone(),
                 messages: BTreeMap::new(),
+                delivery: Some(DeliveryIndex::default()),
                 deduplication: BTreeMap::new(),
                 attempts: BTreeMap::new(),
                 moving: None,
@@ -188,6 +262,7 @@ impl QueueManager {
         let queue = self.get_mut(name)?;
         let ids = queue.messages.keys().cloned().collect::<Vec<_>>();
         queue.messages.clear();
+        queue.delivery = Some(DeliveryIndex::default());
         queue.deduplication.clear();
         self.events
             .extend(ids.into_iter().map(|id| QueueEvent::MessageRemoved {
@@ -199,6 +274,7 @@ impl QueueManager {
 
     /// Replace mutable configuration; queue identity and FIFO mode are immutable.
     pub fn update_queue(&mut self, config: QueueConfig) -> Result<(), Error> {
+        self.validate_dead_letters(&config)?;
         let dead_letters = config
             .dead_letter_queue
             .as_ref()
@@ -219,6 +295,49 @@ impl QueueManager {
         queue.dead_letters = dead_letters;
         queue.config = config.clone();
         self.events.push(QueueEvent::QueueMetadataUpdated(config));
+        Ok(())
+    }
+
+    fn validate_dead_letters(&self, config: &QueueConfig) -> Result<(), Error> {
+        if let Some(dlq) = &config.dead_letter_queue {
+            if let Some(target) = self.queues.get(&dlq.name)
+                && target.config.fifo != config.fifo
+            {
+                return Err(Error::InvalidParameter(
+                    "Source and dead-letter queues must have the same FIFO mode".into(),
+                ));
+            }
+            // Restore ordering includes copy, move and DLQ dependencies. Reject
+            // an update that would make that persisted graph impossible to load.
+            let mut pending = vec![dlq.name.clone()];
+            let mut visited = BTreeSet::new();
+            while let Some(name) = pending.pop() {
+                if name == config.name {
+                    return Err(Error::RoutingCycle(name));
+                }
+                if !visited.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(queue) = self.queues.get(&name) {
+                    pending.extend(
+                        [
+                            &queue.config.copy_messages_to,
+                            &queue.config.move_messages_to,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                    );
+                    pending.extend(
+                        queue
+                            .config
+                            .dead_letter_queue
+                            .iter()
+                            .map(|dlq| dlq.name.clone()),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -380,7 +499,11 @@ impl QueueManager {
                     message: message.clone(),
                 });
         }
-        queue.messages.insert(message.id.clone(), message.clone());
+        if let Some(previous) = queue.messages.insert(message.id.clone(), message.clone()) {
+            queue.reindex(&previous, &message);
+        } else if let Some(index) = &mut queue.delivery {
+            index.insert(&message, queue.config.fifo);
+        }
         self.events.push(QueueEvent::MessageAdded {
             queue: name.into(),
             message,
@@ -440,9 +563,13 @@ impl QueueManager {
                 if let Some(target) = &dead_letters
                     && self.is_live(target)
                 {
-                    self.move_to_dlq(&target.name, name, message.clone(), now)?;
+                    // Upstream DLQ delivery is asynchronous: rejection must not
+                    // abort a receive batch or strand the poison message.
+                    if let Err(error) = self.move_to_dlq(&target.name, name, message.clone(), now) {
+                        eprintln!("Dead-letter delivery {name} -> {}: {error}", target.name);
+                    }
                 }
-                self.get_mut(name)?.messages.remove(&id);
+                self.get_mut(name)?.remove_message(&id);
                 self.events.push(QueueEvent::MessageRemoved {
                     queue: name.into(),
                     id,
@@ -451,6 +578,7 @@ impl QueueManager {
             }
             let queue = self.get_mut(name)?;
             let message = queue.messages.get_mut(&id).expect("selection invariant");
+            let previous = message.clone();
             message.receipt_handle = Some(format!("{}#{}", message.id, Uuid::new_v4()));
             message.next_delivery = after(
                 now,
@@ -461,6 +589,7 @@ impl QueueManager {
             message.receive_count = message.receive_count.saturating_add(1);
             message.first_receive.get_or_insert(now);
             let message = message.clone();
+            queue.reindex(&previous, &message);
             queue.refresh_history(&message);
             self.events.push(QueueEvent::MessageUpdated {
                 queue: name.into(),
@@ -543,7 +672,7 @@ impl QueueManager {
             .ok_or_else(|| Error::InvalidReceiptHandle(receipt.into()))?;
         let message = message.clone();
         queue.refresh_history(&message);
-        queue.messages.remove(id);
+        queue.remove_message(id);
         self.events.push(QueueEvent::MessageRemoved {
             queue: name.into(),
             id: id.into(),
@@ -565,14 +694,21 @@ impl QueueManager {
             .get_mut(id)
             .filter(|m| m.receipt_handle.as_deref() == Some(receipt))
             .ok_or_else(|| Error::InvalidReceiptHandle(receipt.into()))?;
+        let previous = message.clone();
         message.next_delivery = after(now, timeout_ms);
         let message = message.clone();
+        queue.reindex(&previous, &message);
         queue.refresh_history(&message);
         self.events.push(QueueEvent::MessageUpdated {
             queue: name.into(),
             message,
         });
         Ok(())
+    }
+
+    /// Earliest delivery time, respecting blocked FIFO group heads.
+    pub fn next_delivery(&mut self, name: &str) -> Result<Option<Timestamp>, Error> {
+        Ok(self.get_mut(name)?.next_delivery())
     }
 
     pub fn statistics(&self, name: &str, now: Timestamp) -> Result<QueueStatistics, Error> {
@@ -703,7 +839,7 @@ impl QueueManager {
             );
         }
         let queue = self.get_mut(&source.name)?;
-        queue.messages.remove(&message.id);
+        queue.remove_message(&message.id);
         queue
             .moving
             .as_mut()

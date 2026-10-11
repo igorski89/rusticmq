@@ -719,3 +719,137 @@ fn fifo_move_tasks_preserve_order_and_group_metadata() {
     );
     assert!(messages.iter().all(|m| m.group_id.as_deref() == Some("g")));
 }
+
+#[test]
+fn rejected_dead_letter_copy_does_not_abort_or_wedge_receives() {
+    let mut manager = manager();
+    fifo(&mut manager, "copy.fifo");
+    manager
+        .create_queue(
+            CreateQueue {
+                copy_messages_to: Some("copy.fifo".into()),
+                ..CreateQueue::named("dlq")
+            },
+            0,
+        )
+        .unwrap();
+    let mut config = manager.queue("q").unwrap().clone();
+    config.dead_letter_queue = Some(DeadLetterQueue {
+        name: "dlq".into(),
+        max_receive_count: 1,
+    });
+    manager.update_queue(config).unwrap();
+    manager
+        .send_message("q", SendMessage::body("poison"), 0)
+        .unwrap();
+    receive(&mut manager, "q", 1, 0);
+    manager
+        .send_message("q", SendMessage::body("healthy"), 30_001)
+        .unwrap();
+    let messages = receive(&mut manager, "q", 10, 30_001);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body, "healthy");
+    assert_eq!(manager.messages("q").unwrap().len(), 1);
+    assert!(manager.messages("dlq").unwrap().is_empty());
+    manager
+        .delete_message("q", messages[0].receipt_handle.as_deref().unwrap())
+        .unwrap();
+    assert!(receive(&mut manager, "q", 10, 60_002).is_empty());
+}
+
+#[test]
+fn invalid_dead_letter_types_and_dependency_cycles_are_rejected_before_mutation() {
+    let mut manager = manager();
+    fifo(&mut manager, "dlq.fifo");
+    let original = manager.queue("q").unwrap().clone();
+    let mut config = original.clone();
+    config.dead_letter_queue = Some(DeadLetterQueue {
+        name: "dlq.fifo".into(),
+        max_receive_count: 1,
+    });
+    assert!(manager.update_queue(config).is_err());
+    assert_eq!(manager.queue("q").unwrap(), &original);
+    assert!(
+        manager
+            .create_queue(
+                CreateQueue {
+                    dead_letter_queue: Some(DeadLetterQueue {
+                        name: "dlq.fifo".into(),
+                        max_receive_count: 1
+                    }),
+                    ..CreateQueue::named("bad")
+                },
+                0
+            )
+            .is_err()
+    );
+    assert!(manager.queue("bad").is_err());
+    for target in ["q", "copy"] {
+        if target == "copy" {
+            manager
+                .create_queue(
+                    CreateQueue {
+                        copy_messages_to: Some("q".into()),
+                        ..CreateQueue::named("copy")
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+        let mut config = original.clone();
+        config.dead_letter_queue = Some(DeadLetterQueue {
+            name: target.into(),
+            max_receive_count: 1,
+        });
+        assert!(matches!(
+            manager.update_queue(config),
+            Err(Error::RoutingCycle(_))
+        ));
+        assert_eq!(manager.queue("q").unwrap(), &original);
+    }
+    manager.create_queue(CreateQueue::named("b"), 0).unwrap();
+    let mut config = original.clone();
+    config.dead_letter_queue = Some(DeadLetterQueue {
+        name: "b".into(),
+        max_receive_count: 1,
+    });
+    manager.update_queue(config).unwrap();
+    let mut config = manager.queue("b").unwrap().clone();
+    config.dead_letter_queue = Some(DeadLetterQueue {
+        name: "q".into(),
+        max_receive_count: 1,
+    });
+    assert!(manager.update_queue(config).is_err());
+    assert!(manager.queue("b").unwrap().dead_letter_queue.is_none());
+    let definitions = manager
+        .list_queues(None)
+        .iter()
+        .map(|name| manager.queue(name).unwrap().clone())
+        .collect();
+    QueueManager::new().restore_queues(definitions).unwrap();
+}
+
+#[test]
+fn delivery_indexes_track_visibility_replacement_purge_and_snapshot_restore() {
+    let mut manager = manager();
+    let sent = manager
+        .send_message("q", SendMessage::body("first"), 0)
+        .unwrap();
+    let received = receive(&mut manager, "q", 1, 0).remove(0);
+    assert_eq!(manager.next_delivery("q").unwrap(), Some(30_000));
+    manager
+        .change_visibility("q", received.receipt_handle.as_deref().unwrap(), 100, 0)
+        .unwrap();
+    assert_eq!(manager.next_delivery("q").unwrap(), Some(100));
+    let mut replacement = sent;
+    replacement.next_delivery = 200;
+    manager.restore_messages("q", vec![replacement]).unwrap();
+    assert_eq!(manager.next_delivery("q").unwrap(), Some(200));
+    let mut restored: QueueManager =
+        serde_json::from_value(serde_json::to_value(&manager).unwrap()).unwrap();
+    assert!(receive(&mut restored, "q", 1, 199).is_empty());
+    assert_eq!(receive(&mut restored, "q", 1, 200)[0].body, "first");
+    restored.purge_queue("q").unwrap();
+    assert_eq!(restored.next_delivery("q").unwrap(), None);
+    assert!(receive(&mut restored, "q", 1, 100_000).is_empty());
+}

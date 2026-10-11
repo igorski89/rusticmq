@@ -63,16 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.base_url = format!("http://{}{}", listener.local_addr()?, config.context_path);
     }
     eprintln!("RusticMQ listening on {}", listener.local_addr()?);
-    axum::serve(
-        listener,
-        SqsService::new(manager, config)
-            .with_persistence(persistence)
-            .router(),
-    )
-    .with_graceful_shutdown(async {
-        shutdown_signal().await;
-    })
-    .await?;
+    let service = SqsService::new(manager, config).with_persistence(persistence);
+    axum::serve(listener, service.clone().router())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            service.shutdown();
+        })
+        .await?;
     Ok(())
 }
 

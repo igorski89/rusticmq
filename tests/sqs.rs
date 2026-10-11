@@ -895,3 +895,121 @@ async fn invalid_task_handles_and_arns_return_sdk_error_shapes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["__type"], "com.amazonaws.sqs#QueueDoesNotExist");
 }
+
+#[tokio::test]
+async fn shutdown_finishes_existing_and_new_relaxed_long_polls() {
+    let service = SqsService::new(
+        QueueManager::new(),
+        ServerConfig {
+            relaxed_limits: true,
+            ..Default::default()
+        },
+    );
+    let app = service.clone().router();
+    let url = create(&app, "q").await;
+    let waiting_app = app.clone();
+    let request = json!({"QueueUrl":url,"WaitTimeSeconds":86400});
+    let waiting_request = request.clone();
+    let waiting =
+        tokio::spawn(async move { ok(&waiting_app, "ReceiveMessage", waiting_request).await });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!waiting.is_finished());
+    service.shutdown();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["Messages"], json!([]));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        ok(&app, "ReceiveMessage", request),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["Messages"], json!([]));
+}
+
+#[tokio::test]
+async fn move_worker_recovers_when_initial_persistence_fails() {
+    use rusticmq::{CreateQueue, SendMessage, persistence::Persistence};
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("unavailable");
+    let store = Persistence::open(
+        Some(parent.join("queues.conf")),
+        Some(":memory:".into()),
+        false,
+    )
+    .unwrap();
+    let mut manager = QueueManager::new();
+    manager
+        .create_queue(CreateQueue::named("source"), 0)
+        .unwrap();
+    manager
+        .create_queue(CreateQueue::named("target"), 0)
+        .unwrap();
+    manager
+        .send_message("source", SendMessage::body("recover"), 0)
+        .unwrap();
+    let service = SqsService::new(manager, ServerConfig::default()).with_persistence(store);
+    let app = service.clone().router();
+    let request = json!({"SourceArn":"arn:aws:sqs:elasticmq:000000000000:source", "DestinationArn":"arn:aws:sqs:elasticmq:000000000000:target"});
+    let (status, error) = call(&app, "StartMessageMoveTask", request.clone()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error["__type"], "com.amazonaws.sqs#InternalError");
+    {
+        let manager = service.manager.lock().await;
+        assert_eq!(manager.messages("source").unwrap().len(), 1);
+        assert!(manager.messages("target").unwrap().is_empty());
+        assert_eq!(
+            manager.list_move_tasks("source").unwrap()[0].status,
+            rusticmq::MoveTaskStatus::Running
+        );
+    }
+    std::fs::create_dir(&parent).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let manager = service.manager.lock().await;
+            if manager.list_move_tasks("source").unwrap()[0].status
+                == rusticmq::MoveTaskStatus::Completed
+            {
+                assert!(manager.messages("source").unwrap().is_empty());
+                assert_eq!(manager.messages("target").unwrap()[0].body, "recover");
+                break;
+            }
+            drop(manager);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    ok(&app, "StartMessageMoveTask", request).await;
+}
+
+#[tokio::test]
+async fn long_poll_wakes_at_delayed_delivery_without_another_request() {
+    use rusticmq::{CreateQueue, SendMessage};
+    let mut manager = QueueManager::new();
+    manager.create_queue(CreateQueue::named("q"), 0).unwrap();
+    manager
+        .send_message(
+            "q",
+            SendMessage {
+                delay_ms: Some(100),
+                ..SendMessage::body("delayed")
+            },
+            rusticmq::sqs::now(),
+        )
+        .unwrap();
+    let app = SqsService::new(manager, ServerConfig::default()).router();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        ok(
+            &app,
+            "ReceiveMessage",
+            json!({"QueueUrl":"/000000000000/q", "WaitTimeSeconds":2}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["Messages"][0]["Body"], "delayed");
+}

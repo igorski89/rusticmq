@@ -11,11 +11,11 @@ file path enables durable queues and messages. H2 file compatibility is excluded
 
 | Backend requirement | Implementation | Verification |
 | --- | --- | --- |
-| Standard/FIFO queues, delays, visibility, receipt handles, statistics, deduplication, receive attempts, tags and queue lifecycle | `src/engine.rs`, `src/model.rs` | 28 engine tests; original Java SDK scenarios; concurrent standard/FIFO delivery workload |
+| Standard/FIFO queues, delays, visibility, receipt handles, statistics, deduplication, receive attempts, tags and queue lifecycle | `src/engine.rs`, `src/model.rs` | 31 engine tests; original Java SDK scenarios; concurrent standard/FIFO delivery workload |
 | Dead-letter routing, copy/move routing and bound destination identity | Queue engine and startup dependency ordering | Engine tests for deleted/recreated destinations, late destinations, DLQ copies and receive retries; original SDK DLQ scenarios |
-| All 23 upstream SQS actions in JSON and Query/XML | `src/sqs` | 25 Rust HTTP/protocol tests; 150 original Java SDK tests; five original Node.js SDK tests; 14 boto3 checks; three Query/XML workflows exercising all 23 actions |
+| All 23 upstream SQS actions in JSON and Query/XML | `src/sqs` | 28 Rust HTTP/protocol tests; 150 original Java SDK tests; five original Node.js SDK tests; 14 boto3 checks; three Query/XML workflows exercising all 23 actions |
 | Attributes, MD5 digests, binary values, trace headers, validation, batch failures and SDK errors | Protocol conversion and request handlers | Original unchanged Java SDK assertions, including binary attributes, empty custom types and typed JSON exceptions; Rust and Query/XML regression tests |
-| Long polling and concurrent consumers | Shared serialized engine with polling outside the mutex | Rust concurrent polling tests; SDK polling scenarios; eight-client load check |
+| Long polling and concurrent consumers | Shared serialized engine with polling outside the mutex | Rust concurrent polling tests; SDK polling scenarios; eight-thread load check |
 | Asynchronous message move tasks, rate limits, cancellation and history | Engine tasks and background worker | Engine, Rust HTTP, boto3, original Java SDK and Query/XML tests; persistence failures are retried before further moves |
 | Durable SQLite updates, deletes, visibility and startup restore | Transactional SQLite with foreign keys, WAL and full synchronization | 10 persistence tests, including FIFO order/group blocking/deduplication/sequence restore; four real process-restart checks; container replacement check |
 | Queue definitions file, startup queues, routing, durations and tags | Atomic definitions writes and HOCON loader | Persistence tests and a process-restart configuration/copy-route test |
@@ -49,16 +49,51 @@ validation and legacy redrive queue names. Each has a regression test. The vendo
 HOCON parser has a documented fix for trailing indented whitespace in
 `vendor/hocon/PATCHES.md`.
 
-## Final local checks
+## Review fixes
 
-- 63 Rust tests: 28 engine, 25 HTTP/protocol and 10 persistence.
+DLQ configuration rejects mismatched FIFO modes and dependency cycles before
+mutation. Rejected DLQ delivery no longer aborts receives, matching upstream's
+best-effort source removal. Move workers start even if their initial persistence
+flush fails; they retry pending events before moving messages. A failed commit
+returns an error while keeping the in-memory mutation and pending events for
+retry; callers should account for that when retrying requests. Shutdown wakes
+long polls, including requests above 20 seconds in relaxed mode.
+
+Derived ordered delivery indexes replace sorting all messages on each receive.
+They track insertion, replacement, deletion and visibility updates, and rebuild
+from messages after engine deserialization. FIFO group order and head blocking
+remain unchanged. Long polls wait for notifications or the next delivery time.
+
+A local release benchmark at depth 50,000 measured 100 standard receives at about
+280 ms before and 2.2 ms after; FIFO with eight groups measured about 474 ms before
+and 0.3 ms after. Empty probes improved from 284/498 ms to below 0.1 ms. This
+isolates receive selection from sending, persistence and network costs; FIFO
+receives deliver 80 messages before all eight groups block. The reproducible
+command is documented in `BUILDING.md`.
+
+Docker audits rerun the Rust stage with caching disabled for that stage, validate
+suite counts, and write execution evidence and a machine-readable summary.
+Process/container deletion checks assert visible, invisible and delayed counts
+are all zero after restart, so persisted visibility cannot hide a missed delete.
+
+## Current local checks
+
+The review-fix Docker audit passed 247 tests on each of AMD64 and ARM64: 69 Rust,
+150 original Java SDK, five original Node.js SDK, 14 boto3, three Query/XML, five
+process/container lifecycle scenarios and one named-volume persistence test.
+Both summaries confirm Rust tests executed in this run. Logs and machine-readable
+summaries are in `target/docker-audit/{amd64,arm64}`. Each architecture also passed
+the concurrent 1,000-message standard and FIFO workload.
+
+- 69 Rust tests: 31 engine, 28 HTTP/protocol and 10 persistence.
 - 150 original Java SDK scenarios and five original Node.js SDK tests.
 - 14 boto3 integration checks and three complete Query/XML workflows.
-- Four process-restart checks and one non-root named-volume container check
-  spanning three container generations.
-- Formatting and Clippy with warnings denied.
-- Concurrent standard/FIFO workload: all 1,000 messages per queue delivered and
-  deleted without duplicates or omissions across eight consumer clients.
+- Five process-restart checks, including SIGTERM during an active long poll,
+  and one non-root named-volume container check spanning three container generations.
+- Four audit-evidence regression checks; formatting and Clippy with warnings denied.
+- Concurrent standard/FIFO workload: all 1,000 messages per Docker queue and
+  10,000 per native queue delivered and deleted without duplicates or omissions
+  across eight consumer threads sharing an SDK client.
 
 Throughput from the load script is a local smoke measurement including SDK
 overhead; it is not an ElasticMQ comparison. Test results verify the implemented
@@ -66,9 +101,9 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
-## Linux Docker publication audit
+## Initial Linux Docker publication audit (before review fixes)
 
-The complete audit passed for both `linux/amd64` and `linux/arm64` using
+The original pre-review audit passed for both `linux/amd64` and `linux/arm64` using
 `integration/docker.py`. Rust tests executed in each architecture's musl builder;
 the HTTP, SDK, restart and load checks used its final non-root `scratch` image.
 ARM64 ran natively in Docker Desktop's Linux VM and AMD64 used its emulation.
@@ -84,7 +119,8 @@ ARM64 ran natively in Docker Desktop's Linux VM and AMD64 used its emulation.
 | Non-root volume persistence across three replacements | 1 passed | 1 passed |
 | Concurrent standard/FIFO workload | 1,000 messages each, complete delivery/deletion | 1,000 messages each, complete delivery/deletion |
 
-Both `localhost:5555/igorski89/rusticmq:latest` and
+The initial publication predates the review fixes described above. Both
+`localhost:5555/igorski89/rusticmq:latest` and
 `localhost:5555/igorski89/rusticmq:0.1.0` were published with the same
 multi-architecture manifest digest:
 

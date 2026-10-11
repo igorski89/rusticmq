@@ -195,7 +195,7 @@ state across three container replacements without relying on tools in the image.
 ## Full Docker verification
 
 The complete audit builds and tests both `linux/amd64` and `linux/arm64`, including
-all 63 Rust tests in the musl builder, all 150 original Java SDK scenarios and
+all 69 Rust tests in the musl builder, all 150 original Java SDK scenarios and
 five original Node.js SDK tests against the runtime image, boto3 and Query/XML
 workflows, container/process restarts, named-volume persistence and the concurrent
 standard/FIFO load check:
@@ -217,7 +217,22 @@ native Linux runners for each architecture. Logs are in
 
 The Dockerfile's `test` stage is separate from its minimal runtime stage. A normal
 `docker build` produces only the runtime; `integration/docker.py` explicitly
-builds the test stage and requires every suite to pass.
+builds the test stage with `--no-cache-filter test`, so even a warm cache reruns
+Rust tests. It validates the executed test counts for every suite and writes
+`rust-executed.log` and `summary.json` alongside the runtime logs. `--skip-build`
+explicitly skips Rust execution and records that fact in the summary.
+
+For a receive-path benchmark at queue depths of 10,000 and 50,000:
+
+```sh
+cargo run --locked --release --example queue_benchmark -- 10000 50000
+```
+
+It measures 100 receives and 100 empty probes for standard queues and FIFO queues
+with eight groups. Messages are preloaded through the restore path to isolate
+selection/index costs from sending, SQLite commits and HTTP/SDK overhead. FIFO
+heads become invisible during the receive workload, so it also measures blocked
+groups. Results are local measurements, not throughput guarantees.
 
 After both audits pass, publish a multi-architecture image to the local registry:
 

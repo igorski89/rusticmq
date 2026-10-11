@@ -122,6 +122,7 @@ pub struct SqsService {
     pub manager: Arc<Mutex<QueueManager>>,
     pub config: ServerConfig,
     changed: watch::Sender<u64>,
+    stopping: watch::Sender<bool>,
     persistence: Option<Arc<crate::persistence::Persistence>>,
 }
 
@@ -129,10 +130,12 @@ impl SqsService {
     pub fn new(mut manager: QueueManager, config: ServerConfig) -> Self {
         manager.set_relaxed_limits(config.relaxed_limits);
         let (changed, _) = watch::channel(0);
+        let (stopping, _) = watch::channel(false);
         Self {
             manager: Arc::new(Mutex::new(manager)),
             config,
             changed,
+            stopping,
             persistence: None,
         }
     }
@@ -154,6 +157,11 @@ impl SqsService {
     pub fn with_persistence(mut self, persistence: crate::persistence::Persistence) -> Self {
         self.persistence = Some(Arc::new(persistence));
         self
+    }
+
+    /// Finish outstanding long polls before the HTTP server drains connections.
+    pub fn shutdown(&self) {
+        self.stopping.send_replace(true);
     }
 
     fn wait_limit(&self) -> u64 {
@@ -206,7 +214,7 @@ impl SqsService {
         }
         let mut manager = self.manager.lock().await;
         let result = self.dispatch(&mut manager, action, &request, tracing, now());
-        self.notify_change(&mut manager)?;
+        let persisted = self.notify_change(&mut manager);
         if action == "StartMessageMoveTask"
             && let Ok(value) = &result
             && let Some(handle) = value["TaskHandle"].as_str()
@@ -217,6 +225,7 @@ impl SqsService {
                 service.run_move_task(handle).await;
             });
         }
+        persisted?;
         result
     }
 
@@ -703,21 +712,33 @@ impl SqsService {
             .checked_add(Duration::from_secs(wait))
             .ok_or_else(|| ApiError::invalid("WaitTimeSeconds is too large"))?;
         let mut changed = self.changed.subscribe();
+        let mut stopping = self.stopping.subscribe();
         loop {
-            let messages = {
+            if *stopping.borrow() {
+                return Ok(json!({"Messages":[]}));
+            }
+            let (messages, next_delivery) = {
                 let mut manager = self.manager.lock().await;
                 let messages = manager.receive_messages(&name, request.clone(), now());
                 self.notify_change(&mut manager)?;
-                messages?
+                (messages?, manager.next_delivery(&name)?)
             };
             if !messages.is_empty() || tokio::time::Instant::now() >= deadline {
                 return Ok(
                     json!({"Messages": messages.iter().map(|m| self.received(m, &system_names, &attribute_names)).collect::<Vec<_>>()}),
                 );
             }
+            let wake = next_delivery
+                .map(|at| {
+                    tokio::time::Instant::now()
+                        + Duration::from_millis(at.saturating_sub(now()).max(1) as u64)
+                })
+                .unwrap_or(deadline)
+                .min(deadline);
             tokio::select! {
+                _ = stopping.changed() => {},
                 _ = changed.changed() => {},
-                _ = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(25))) => {},
+                _ = tokio::time::sleep_until(wake) => {},
             }
         }
     }

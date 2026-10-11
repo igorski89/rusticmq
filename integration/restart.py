@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import URLError
@@ -111,7 +112,26 @@ class RestartTests(unittest.TestCase):
         self.client.delete_message(QueueUrl=url, ReceiptHandle=again["ReceiptHandle"])
         self.stop()
         self.start(args)
+        attributes = self.client.get_queue_attributes(QueueUrl=url, AttributeNames=[
+            "ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible",
+            "ApproximateNumberOfMessagesDelayed"])["Attributes"]
+        self.assertEqual(set(attributes.values()), {"0"})
         self.assertFalse(self.client.receive_message(QueueUrl=url).get("Messages"))
+
+    def test_sigterm_finishes_an_active_long_poll(self):
+        self.start()
+        url = self.client.create_queue(QueueName="shutdown")["QueueUrl"]
+        client = boto3.client("sqs", endpoint_url=f"http://127.0.0.1:{self.port}",
+            region_name="elasticmq", aws_access_key_id="x", aws_secret_access_key="x",
+            config=Config(retries={"max_attempts": 0}, read_timeout=25))
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            waiting = executor.submit(client.receive_message, QueueUrl=url, WaitTimeSeconds=20)
+            time.sleep(0.2)
+            self.assertFalse(waiting.done())
+            started = time.monotonic()
+            self.stop()
+            self.assertLess(time.monotonic() - started, 3, "Shutdown waited for the long-poll deadline")
+            self.assertFalse(waiting.result(timeout=3).get("Messages"))
 
     def test_default_memory_database_is_ephemeral(self):
         self.start()

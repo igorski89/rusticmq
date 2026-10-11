@@ -5,6 +5,8 @@ and the pinned ElasticMQ source checkout. See BUILDING.md for invocation.
 """
 import argparse
 import os
+import re
+import json
 import socket
 import subprocess
 import sys
@@ -16,6 +18,28 @@ from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_TESTS = {"rust": 69, "aws_sdk": 14, "query": 3, "restart": 5, "container": 1,
+    "upstream_java": 150, "upstream_node": 5}
+
+
+def check_test_count(log_path, suite):
+    output = log_path.read_text()
+    if suite == "rust":
+        results = re.findall(r"test result: ok\. (\d+) passed; 0 failed; 0 ignored; 0 measured; 0 filtered out", output)
+        count = sum(map(int, results))
+    elif suite == "upstream_java":
+        results = re.findall(r"Tests: succeeded (\d+), failed 0, canceled 0, ignored 0, pending 0", output)
+        count = sum(map(int, results))
+    elif suite == "upstream_node":
+        results = re.findall(r"Tests:\s+(\d+) passed, \d+ total", output)
+        count = sum(map(int, results))
+    else:
+        results = re.findall(r"Ran (\d+) tests? in", output)
+        count = sum(map(int, results))
+    expected = EXPECTED_TESTS[suite]
+    if count != expected:
+        raise RuntimeError(f"{suite}: expected {expected} executed tests, found {count} in {log_path}")
+    return count
 
 
 def run(command, log_path, env=None):
@@ -60,6 +84,8 @@ def check_runtime(image, platform, report_dir):
             if suite == "load":
                 command += ["1000"]
             run(command, report_dir / f"{suite}.log", env)
+            if suite in EXPECTED_TESTS:
+                check_test_count(report_dir / f"{suite}.log", suite)
         docker("stop", "--time", "10", container)
         if docker("inspect", "--format", "{{.State.ExitCode}}", container) != "0":
             raise RuntimeError("The runtime did not exit cleanly on SIGTERM")
@@ -79,9 +105,12 @@ def main():
         image = f"{args.image_prefix}-{architecture}"
         report_dir = ROOT / "target/docker-audit" / architecture
         report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / "summary.json").unlink(missing_ok=True)
         if not args.skip_build:
             run(["docker", "buildx", "build", "--platform", platform, "--target", "test",
-                "--output", "type=cacheonly", "."], report_dir / "rust.log")
+                "--no-cache-filter", "test", "--progress", "plain",
+                "--output", "type=cacheonly", "."], report_dir / "rust-executed.log")
+            check_test_count(report_dir / "rust-executed.log", "rust")
             run(["docker", "buildx", "build", "--platform", platform, "--load", "--tag", image, "."], report_dir / "build.log")
         if docker("image", "inspect", "--format", "{{.Architecture}}", image) != architecture:
             raise RuntimeError(f"{image} has the wrong architecture")
@@ -90,8 +119,16 @@ def main():
         env.update(RUSTICMQ_IMAGE=image, RUSTICMQ_PLATFORM=platform)
         for suite in ("restart", "container"):
             run([sys.executable, str(ROOT / "integration" / f"{suite}.py")], report_dir / f"{suite}.log", env)
+            check_test_count(report_dir / f"{suite}.log", suite)
         run([sys.executable, str(ROOT / "integration/upstream/run.py"), args.source,
             "--nodejs", "--image", image, "--platform", platform], report_dir / "upstream.log")
+        for suite in ("upstream_java", "upstream_node"):
+            check_test_count(report_dir / "upstream.log", suite)
+        summary = {"platform": platform, "image": image,
+            "rust_tests_executed_this_run": not args.skip_build,
+            "test_counts": {suite: count for suite, count in EXPECTED_TESTS.items()
+                if suite != "rust" or not args.skip_build}}
+        (report_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         print(f"All backend suites passed for {platform}: {image}", flush=True)
 
 

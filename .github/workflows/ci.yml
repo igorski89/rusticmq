@@ -26,6 +26,7 @@ jobs:
       - run: cargo test --locked --all-targets
       - run: cargo build --locked
       - run: python3 -m pip install boto3
+      - run: python3 integration/audit_checks.py
       - run: python3 integration/restart.py
       - name: AWS SDK integration
         run: |
