@@ -101,6 +101,20 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
+## Review-fix Docker publication
+
+The images from review-fix commit `9679a14` were published to
+`localhost:5555/igorski89/rusticmq:latest` and `:0.1.0` on 2026-10-12.
+Both tags point to the same AMD64/ARM64 manifest index:
+
+```text
+sha256:86f63afa0e701e05478c1d8e191be234236fcb656cbf6e5ae1725ecf93080de8
+```
+
+Registry filesystem layers and runtime configurations match the images that
+passed all 247 tests per architecture. Explicit pulls, health checks and graceful
+SIGTERM shutdown passed for both published architectures.
+
 ## Initial Linux Docker publication audit (before review fixes)
 
 The original pre-review audit passed for both `linux/amd64` and `linux/arm64` using
