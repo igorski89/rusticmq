@@ -87,6 +87,14 @@ impl AppConfig {
                 relaxed_limits,
                 auto_create_template,
                 wildcard_queue_urls: host == "*",
+                max_content_length: size(
+                    nested(
+                        &doc,
+                        &["pekko", "http", "server", "parsing", "max-content-length"],
+                    ),
+                    "max-content-length",
+                    8 * 1024 * 1024,
+                )?,
             },
             queues: read_queues(&doc, now)?,
             queue_storage: if boolean(queues, "enabled", false)? {
@@ -196,6 +204,33 @@ pub(crate) fn absent(value: &Hocon) -> bool {
         value,
         Hocon::Null | Hocon::BadValue(hocon::Error::MissingKey)
     )
+}
+/// Follows nested keys, treating a missing or non-object parent as absent.
+fn nested<'a>(document: &'a Hocon, keys: &[&str]) -> &'a Hocon {
+    static MISSING: Hocon = Hocon::Null;
+    keys.iter()
+        .try_fold(document, |value, key| match value {
+            Hocon::Hash(hash) => hash.get(*key),
+            _ => None,
+        })
+        .unwrap_or(&MISSING)
+}
+/// Reads a HOCON size such as `500m`; `infinite` yields `None`.
+fn size(value: &Hocon, key: &str, default: usize) -> Result<Option<usize>, ConfigError> {
+    if absent(value) {
+        return Ok(Some(default));
+    }
+    if value.as_string().as_deref() == Some("infinite") {
+        return Ok(None);
+    }
+    match value {
+        Hocon::Integer(bytes) if *bytes < 0 => None,
+        _ => value
+            .as_bytes()
+            .and_then(|bytes| usize::try_from(bytes).ok()),
+    }
+    .map(Some)
+    .ok_or_else(|| format!("Invalid size for {key}").into())
 }
 pub(crate) fn text(document: &Hocon, key: &str) -> Result<Option<String>, ConfigError> {
     let value = &document[key];

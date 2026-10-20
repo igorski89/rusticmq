@@ -63,6 +63,40 @@ fn hocon_reads_auto_creation_templates_relaxed_limits_and_root_context() {
 }
 
 #[test]
+fn hocon_reads_pekko_max_content_length() {
+    assert_eq!(
+        AppConfig::load(None, 0).unwrap().service.max_content_length,
+        Some(8 * 1024 * 1024)
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("elasticmq.conf");
+    for (conf, expected) in [
+        (
+            "pekko { http { server { parsing { max-content-length = 500m } } } }",
+            Some(500 * 1024 * 1024),
+        ),
+        (
+            "pekko.http.server.parsing.max-content-length = 1024",
+            Some(1024),
+        ),
+        (
+            "pekko.http.server.parsing.max-content-length = infinite",
+            None,
+        ),
+        (
+            "pekko.http.client.parsing.max-content-length = 1m",
+            Some(8 * 1024 * 1024),
+        ),
+    ] {
+        fs::write(&path, conf).unwrap();
+        let config = AppConfig::load(Some(&path), 0).unwrap();
+        assert_eq!(config.service.max_content_length, expected, "{conf}");
+    }
+    fs::write(&path, "pekko.http.server.parsing.max-content-length = lots").unwrap();
+    assert!(AppConfig::load(Some(&path), 0).is_err());
+}
+
+#[test]
 fn sqlite_restart_restores_receipts_statistics_attributes_and_visibility() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.sqlite");

@@ -103,6 +103,46 @@ async fn receive_and_lookup_can_auto_create_queues() {
 }
 
 #[tokio::test]
+async fn request_bodies_follow_the_configured_max_content_length() {
+    let body = json!({"QueueUrl":"q","MessageBody":"a".repeat(9 * 1024 * 1024)});
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("x-amz-target", "AmazonSQS.SendMessage")
+                .header("content-type", "application/x-amz-json-1.0")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let app = SqsService::new(
+        QueueManager::new(),
+        ServerConfig {
+            relaxed_limits: true,
+            max_content_length: Some(500 * 1024 * 1024),
+            ..Default::default()
+        },
+    )
+    .router();
+    let url = create(&app, "large").await;
+    let body = "a".repeat(21 * 1024 * 1024);
+    ok(
+        &app,
+        "SendMessage",
+        json!({"QueueUrl":url,"MessageBody":body}),
+    )
+    .await;
+    let received = ok(&app, "ReceiveMessage", json!({"QueueUrl":url})).await;
+    assert_eq!(
+        received["Messages"][0]["Body"].as_str().unwrap().len(),
+        body.len()
+    );
+}
+
+#[tokio::test]
 async fn relaxed_limits_accept_large_batches_counts_and_empty_attributes() {
     let app = SqsService::new(
         QueueManager::new(),

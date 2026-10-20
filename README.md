@@ -38,6 +38,11 @@ queues {
 }
 ```
 
+As in ElasticMQ, `pekko.http.server.parsing.max-content-length` sets the request
+body limit as a HOCON size, such as `500m`, or `infinite`. The default is `8m`.
+Set it together with `rest-sqs.sqs-limits = relaxed` to accept messages larger
+than the SQS limit.
+
 Command-line options override environment variables for the configuration/database
 path. The database environment variable overrides HOCON storage settings. Server
 environment variables override the corresponding HOCON settings.

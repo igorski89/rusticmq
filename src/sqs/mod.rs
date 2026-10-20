@@ -84,6 +84,8 @@ pub struct ServerConfig {
     pub relaxed_limits: bool,
     pub auto_create_template: Option<QueueConfig>,
     pub wildcard_queue_urls: bool,
+    /// Request body limit in bytes; `None` disables it (pekko's `infinite`).
+    pub max_content_length: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -96,6 +98,7 @@ impl Default for ServerConfig {
             relaxed_limits: false,
             auto_create_template: None,
             wildcard_queue_urls: false,
+            max_content_length: Some(8 * 1024 * 1024),
         }
     }
 }
@@ -149,9 +152,11 @@ impl SqsService {
         } else {
             router.nest(&self.config.context_path, Router::new().fallback(handle))
         };
-        router
-            .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
-            .with_state(self)
+        let limit = match self.config.max_content_length {
+            Some(bytes) => DefaultBodyLimit::max(bytes),
+            None => DefaultBodyLimit::disable(),
+        };
+        router.layer(limit).with_state(self)
     }
 
     pub fn with_persistence(mut self, persistence: crate::persistence::Persistence) -> Self {
