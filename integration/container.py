@@ -32,7 +32,7 @@ class ContainerTests(unittest.TestCase):
                 options = ["--platform", platform] if platform else []
                 container = docker("run", *options, "--detach", "--rm", "--publish", "127.0.0.1::9324",
                     "--mount", f"type=volume,source={volume},target=/data",
-                    image, "--database", "/data/messages.sqlite")
+                    image, "--data-dir", "/data")
                 address = docker("port", container, "9324/tcp").splitlines()[0]
                 endpoint = "http://" + address
                 deadline = time.monotonic() + 10

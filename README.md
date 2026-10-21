@@ -18,15 +18,18 @@ The SQS endpoint listens on `0.0.0.0:9324`. `GET /health` returns `OK`.
 AWS SDK clients can use `http://localhost:9324`, region `elasticmq`, and any local
 credentials. Returned queue URLs use account `000000000000`.
 
-Storage uses SQLite in memory by default. Specify a file for durable queues and
-messages, including visibility state and receipt handles:
+Storage uses SQLite in memory by default. Specify a data directory for durable
+queues and messages, including visibility state and receipt handles:
 
 ```sh
-cargo run -- --database ./rusticmq.sqlite
-cargo run -- --config ./elasticmq.conf --database ./rusticmq.sqlite
+cargo run -- --data-dir ./data
+cargo run -- --config ./elasticmq.conf --data-dir ./data
 ```
 
-`--database :memory:` (also `:memory`) selects ephemeral storage. H2 database
+RusticMQ creates the directory if needed and keeps `rusticmq.sqlite` in it, with
+the `-wal` and `-shm` files SQLite writes beside it. Mount or back up the whole
+directory, never the database file alone. `--data-dir :memory:` (also `:memory`)
+selects ephemeral storage. H2 database
 compatibility is excluded. HOCON (Human-Optimized Config Object Notation) is the
 configuration format used by ElasticMQ: it supports readable objects, comments,
 includes and duration values. Existing ElasticMQ HOCON files configure startup
@@ -43,14 +46,14 @@ body limit as a HOCON size, such as `500m`, or `infinite`. The default is `8m`.
 Set it together with `rest-sqs.sqs-limits = relaxed` to accept messages larger
 than the SQS limit.
 
-Command-line options override environment variables for the configuration/database
-path. The database environment variable overrides HOCON storage settings. Server
+Command-line options override environment variables for the configuration path
+and data directory. The data directory overrides HOCON storage settings. Server
 environment variables override the corresponding HOCON settings.
 
 | Option | Environment variable | Default |
 | --- | --- | --- |
 | `--config PATH` | `RUSTICMQ_CONFIG` | No configuration file |
-| `--database PATH` | `RUSTICMQ_DATABASE` | `:memory:` |
+| `--data-dir DIR` | `RUSTICMQ_DATA_DIR` | `:memory:` |
 
 Additional environment variables configure the server:
 
@@ -92,10 +95,10 @@ docker run --rm -p 9324:9324 rusticmq
 ```
 
 This starts an ephemeral instance. `docker compose up --build` uses the supplied
-Compose configuration with a named volume and a SQLite file under `/data`.
+Compose configuration with a named volume as the `/data` data directory.
 The image uses a statically linked musl executable in a `scratch` runtime; it
 includes CA certificates and license notices, with no shell or shared libraries.
-The container runs as UID 10001; bind-mounted database directories must be writable
+The container runs as UID 10001; bind-mounted data directories must be writable
 by that user. Configure `RUSTICMQ_BASE_URL` to the address used by your clients.
 The verified multi-architecture image is available in the local registry as
 `localhost:5555/igorski89/rusticmq:0.1.0` (also `:latest`). Both Linux AMD64 and

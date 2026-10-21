@@ -32,7 +32,7 @@ class RestartTests(unittest.TestCase):
         self.container = None
         if self.image:
             # The runtime keeps its non-root UID; the temporary bind mount must
-            # allow that UID to create database and queue-definition files.
+            # allow that UID to create the data directory and queue-definition files.
             self.root.chmod(0o777)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -95,7 +95,7 @@ class RestartTests(unittest.TestCase):
             self.process = None
 
     def test_sqlite_file_restores_messages_and_valid_receipts(self):
-        args = ["--database", self.root / "messages.sqlite"]
+        args = ["--data-dir", self.root / "data"]
         self.start(args)
         url = self.client.create_queue(QueueName="durable", tags={"team": "rust"})["QueueUrl"]
         sent = self.client.send_message(QueueUrl=url, MessageBody="persisted")

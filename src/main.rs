@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config_path = std::env::var_os("RUSTICMQ_CONFIG").map(PathBuf::from);
-    let mut database_path = std::env::var_os("RUSTICMQ_DATABASE").map(PathBuf::from);
+    let mut data_dir = std::env::var_os("RUSTICMQ_DATA_DIR").map(PathBuf::from);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -17,22 +17,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     args.next().ok_or("--config requires a path")?,
                 ))
             }
-            "--database" => {
-                database_path = Some(PathBuf::from(
+            "--data-dir" => {
+                data_dir = Some(PathBuf::from(
                     args.next()
-                        .ok_or("--database requires a path or :memory:")?,
+                        .ok_or("--data-dir requires a directory or :memory:")?,
                 ))
             }
             "--help" | "-h" => {
-                println!("rusticmq [--config elasticmq.conf] [--database :memory:|PATH]");
+                println!("rusticmq [--config elasticmq.conf] [--data-dir :memory:|DIR]");
                 return Ok(());
             }
             _ => return Err(format!("Unknown argument: {arg}").into()),
         }
     }
     let mut app = AppConfig::load(config_path.as_deref(), now())?;
-    if let Some(path) = database_path {
-        app.message_storage = Some(path);
+    if let Some(dir) = data_dir {
+        app.message_storage = Some(database_in(dir)?);
     }
     if let Ok(value) = std::env::var("RUSTICMQ_BIND") {
         app.bind = value;
@@ -85,4 +85,14 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// SQLite in WAL mode keeps `-wal` and `-shm` files beside the database, so
+/// storage is configured as a directory rather than a single file.
+fn database_in(dir: PathBuf) -> std::io::Result<PathBuf> {
+    if dir.as_os_str() == ":memory:" || dir.as_os_str() == ":memory" {
+        return Ok(PathBuf::from(":memory:"));
+    }
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("rusticmq.sqlite"))
 }

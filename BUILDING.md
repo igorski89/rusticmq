@@ -27,10 +27,10 @@ cargo build --locked --release
 ./target/release/rusticmq
 ```
 
-For a persistent database:
+For persistent storage in a data directory:
 
 ```sh
-./target/release/rusticmq --database ./rusticmq.sqlite
+./target/release/rusticmq --data-dir ./data
 ```
 
 ## Linux
@@ -55,7 +55,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 cd /path/to/rusticmq
 cargo build --locked --release
-./target/release/rusticmq --database ./rusticmq.sqlite
+./target/release/rusticmq --data-dir ./data
 ```
 
 The native build targets your machine's architecture and libc. To distribute a
@@ -80,11 +80,10 @@ cargo build --locked --release
 .\target\release\rusticmq.exe
 ```
 
-For a persistent database, create its parent directory first:
+For persistent storage in a data directory:
 
 ```powershell
-New-Item -ItemType Directory -Force .\data | Out-Null
-.\target\release\rusticmq.exe --database .\data\rusticmq.sqlite
+.\target\release\rusticmq.exe --data-dir .\data
 ```
 
 Environment variables use PowerShell syntax:
@@ -92,14 +91,15 @@ Environment variables use PowerShell syntax:
 ```powershell
 $env:RUSTICMQ_BIND = '127.0.0.1:9324'
 $env:RUSTICMQ_BASE_URL = 'http://localhost:9324'
-.\target\release\rusticmq.exe --database .\data\rusticmq.sqlite
+.\target\release\rusticmq.exe --data-dir .\data
 ```
 
 ## Run and verify
 
 The default listener is `0.0.0.0:9324`; clients use `http://localhost:9324`.
-Without `--database PATH`, storage is in-memory SQLite (`:memory:`). Parent
-directories for database files must exist and be writable. Stop the native server
+Without `--data-dir DIR`, storage is in-memory SQLite (`:memory:`). The data
+directory holds `rusticmq.sqlite` and its `-wal` and `-shm` files; it is created if
+missing and must be writable. Stop the native server
 with Ctrl+C.
 
 While the server runs, check health in another terminal:
@@ -146,11 +146,11 @@ For durable storage, use a named volume:
 
 ```sh
 docker volume create rusticmq-data
-docker run --rm --publish 9324:9324 --mount type=volume,source=rusticmq-data,target=/data rusticmq:local --database /data/rusticmq.sqlite
+docker run --rm --publish 9324:9324 --mount type=volume,source=rusticmq-data,target=/data rusticmq:local --data-dir /data
 ```
 
 Alternatively, `docker compose up --build` uses the supplied named-volume setup.
-Bind-mounted database directories must be writable by UID/GID `10001:10001`.
+Bind-mounted data directories must be writable by UID/GID `10001:10001`.
 Configure `RUSTICMQ_BASE_URL` if clients connect through a different hostname or
 port. `docker stop` sends SIGTERM for graceful shutdown.
 
