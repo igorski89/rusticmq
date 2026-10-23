@@ -34,6 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(dir) = data_dir {
         app.message_storage = Some(database_in(dir)?);
     }
+    app.service.configured_queues = app.queues.len();
+    app.service.persistent_storage = app
+        .message_storage
+        .as_ref()
+        .is_some_and(|path| path.as_os_str() != ":memory:" && path.as_os_str() != ":memory");
     if let Ok(value) = std::env::var("RUSTICMQ_BIND") {
         app.bind = value;
     }

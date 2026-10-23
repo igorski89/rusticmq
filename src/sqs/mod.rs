@@ -86,6 +86,10 @@ pub struct ServerConfig {
     pub wildcard_queue_urls: bool,
     /// Request body limit in bytes; `None` disables it (pekko's `infinite`).
     pub max_content_length: Option<usize>,
+    /// Startup details reported by `rusticmq_config_info` and `/metrics` gauges.
+    pub config_file: Option<String>,
+    pub configured_queues: usize,
+    pub persistent_storage: bool,
 }
 
 impl Default for ServerConfig {
@@ -99,6 +103,9 @@ impl Default for ServerConfig {
             auto_create_template: None,
             wildcard_queue_urls: false,
             max_content_length: Some(8 * 1024 * 1024),
+            config_file: None,
+            configured_queues: 0,
+            persistent_storage: false,
         }
     }
 }
@@ -809,40 +816,156 @@ impl SqsService {
 async fn metrics(State(service): State<SqsService>) -> Response {
     use std::fmt::Write;
     let manager = service.manager.lock().await;
+    let config = &service.config;
     let mut output = String::new();
-    for (name, field) in [
-        ("rusticmq_messages_visible", "Visible messages"),
+    let mut family = |name: &str, kind: &str, help: &str, samples: &[(String, String)]| {
+        let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
+        for (labels, value) in samples {
+            let _ = writeln!(output, "{name}{labels} {value}");
+        }
+    };
+    family(
+        "rusticmq_build_info",
+        "gauge",
+        "Version and source commit of the running build",
+        &[(
+            format!(
+                "{{version=\"{}\",commit=\"{}\"}}",
+                env!("CARGO_PKG_VERSION"),
+                env!("RUSTICMQ_COMMIT")
+            ),
+            "1".into(),
+        )],
+    );
+    family(
+        "rusticmq_config_info",
+        "gauge",
+        "Startup configuration file, storage and SQS limits mode",
+        &[(
+            format!(
+                "{{file=\"{}\",storage=\"{}\",sqs_limits=\"{}\"}}",
+                label_value(config.config_file.as_deref().unwrap_or("")),
+                if config.persistent_storage {
+                    "sqlite"
+                } else {
+                    "memory"
+                },
+                if config.relaxed_limits {
+                    "relaxed"
+                } else {
+                    "strict"
+                }
+            ),
+            "1".into(),
+        )],
+    );
+    family(
+        "rusticmq_config_queues",
+        "gauge",
+        "Queues defined by the startup configuration",
+        &[(String::new(), config.configured_queues.to_string())],
+    );
+    family(
+        "rusticmq_config_max_content_length_bytes",
+        "gauge",
+        "Request body limit; +Inf when unlimited",
+        &[(
+            String::new(),
+            config
+                .max_content_length
+                .map_or("+Inf".into(), |bytes| bytes.to_string()),
+        )],
+    );
+    let time = now();
+    let queues: Vec<_> = manager
+        .list_queues(None)
+        .into_iter()
+        .filter_map(|name| {
+            let stats = manager.statistics(&name, time).ok()?;
+            let activity = manager.activity(&name).ok()?.clone();
+            Some((format!("{{queue=\"{name}\"}}"), stats, activity))
+        })
+        .collect();
+    let per_queue = |value: &dyn Fn(&QueueStatistics, &QueueActivity) -> Option<String>| {
+        queues
+            .iter()
+            .filter_map(|(labels, stats, activity)| Some((labels.clone(), value(stats, activity)?)))
+            .collect::<Vec<_>>()
+    };
+    for (name, kind, help, samples) in [
+        (
+            "rusticmq_messages_visible",
+            "gauge",
+            "Visible messages",
+            per_queue(&|stats, _| Some(stats.visible.to_string())),
+        ),
         (
             "rusticmq_messages_invisible",
+            "gauge",
             "Messages awaiting visibility timeout",
+            per_queue(&|stats, _| Some(stats.invisible.to_string())),
         ),
         (
             "rusticmq_messages_delayed",
+            "gauge",
             "Messages awaiting their initial delivery",
+            per_queue(&|stats, _| Some(stats.delayed.to_string())),
+        ),
+        (
+            "rusticmq_messages_sent_total",
+            "counter",
+            "Messages stored by sends, including copy/move routing; not dead-letter or move-task arrivals",
+            per_queue(&|_, activity| Some(activity.sent.to_string())),
+        ),
+        (
+            "rusticmq_messages_deduplicated_total",
+            "counter",
+            "FIFO sends accepted but not stored as duplicates within five minutes",
+            per_queue(&|_, activity| Some(activity.deduplicated.to_string())),
+        ),
+        (
+            "rusticmq_messages_received_total",
+            "counter",
+            "Messages delivered by receives",
+            per_queue(&|_, activity| Some(activity.received.to_string())),
+        ),
+        (
+            "rusticmq_messages_deleted_total",
+            "counter",
+            "Messages deleted by receipt handle",
+            per_queue(&|_, activity| Some(activity.deleted.to_string())),
+        ),
+        (
+            "rusticmq_queue_last_send_timestamp_seconds",
+            "gauge",
+            "Time of the last send to the queue, stored or deduplicated",
+            per_queue(&|_, activity| activity.last_send.map(seconds)),
+        ),
+        (
+            "rusticmq_queue_last_receive_timestamp_seconds",
+            "gauge",
+            "Time of the last receive request, including empty receives and long-poll wakeups",
+            per_queue(&|_, activity| activity.last_receive.map(seconds)),
         ),
     ] {
-        let _ = writeln!(output, "# HELP {name} {field}\n# TYPE {name} gauge");
-    }
-    let time = now();
-    for name in manager.list_queues(None) {
-        if let Ok(stats) = manager.statistics(&name, time) {
-            for (metric, count) in [
-                ("visible", stats.visible),
-                ("invisible", stats.invisible),
-                ("delayed", stats.delayed),
-            ] {
-                let _ = writeln!(
-                    output,
-                    "rusticmq_messages_{metric}{{queue=\"{name}\"}} {count}"
-                );
-            }
-        }
+        family(name, kind, help, &samples);
     }
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
     )
         .into_response()
+}
+
+fn seconds(millis: Timestamp) -> String {
+    format!("{}.{:03}", millis / 1000, millis % 1000)
+}
+
+fn label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 async fn handle(

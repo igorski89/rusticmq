@@ -79,8 +79,30 @@ Additional environment variables configure the server:
 - SQLite persistence and startup restore, optional queue definitions file, and
   HOCON startup configuration, automatic queue creation templates and relaxed
   limits.
-- Queue gauges at `/metrics` in Prometheus text format (a native replacement for
+- Queue metrics at `/metrics` in Prometheus text format (a native replacement for
   the upstream JVM's JMX metrics), and wildcard node addresses.
+
+## Metrics
+
+`GET /metrics` on the SQS port returns Prometheus text. Per queue, labeled
+`queue`:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `rusticmq_messages_visible`, `_invisible`, `_delayed` | gauge | Current queue depth by state |
+| `rusticmq_messages_sent_total` | counter | Messages stored by sends, including copy/move routing; not dead-letter or move-task arrivals |
+| `rusticmq_messages_deduplicated_total` | counter | FIFO sends accepted but not stored as duplicates |
+| `rusticmq_messages_received_total` | counter | Messages delivered by receives |
+| `rusticmq_messages_deleted_total` | counter | Messages deleted by receipt handle |
+| `rusticmq_queue_last_send_timestamp_seconds` | gauge | Last send, stored or deduplicated |
+| `rusticmq_queue_last_receive_timestamp_seconds` | gauge | Last receive request, including empty receives |
+
+For the server: `rusticmq_build_info{version,commit}`,
+`rusticmq_config_info{file,storage,sqs_limits}`, `rusticmq_config_queues` (queues
+defined by the configuration) and `rusticmq_config_max_content_length_bytes`
+(`+Inf` when unlimited). Counters and timestamps start when the process starts or
+the queue is created; a timestamp is absent until the first send or receive. A
+queue whose messages wait while its last receive grows old has no live consumer.
 
 The original Java SDK v1/v2 suites pass all 150 scenarios against RusticMQ, and
 the original Node.js AWS SDK suite passes all five tests. Additional Rust, boto3,

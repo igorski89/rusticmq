@@ -95,6 +95,9 @@ impl AppConfig {
                     "max-content-length",
                     8 * 1024 * 1024,
                 )?,
+                config_file: path.map(|path| path.display().to_string()),
+                configured_queues: 0,
+                persistent_storage: false,
             },
             queues: read_queues(&doc, now)?,
             queue_storage: if boolean(queues, "enabled", false)? {

@@ -1,10 +1,12 @@
 FROM rust:alpine AS build
 RUN apk add --no-cache musl-dev ca-certificates binutils
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY vendor ./vendor
 COPY src ./src
 COPY LICENSE.txt NOTICE.txt ./
+# The build context has no .git; pass the commit for rusticmq_build_info.
+ARG RUSTICMQ_COMMIT=unknown
 RUN cargo build --locked --profile container \
     && ! readelf --program-headers target/container/rusticmq | grep -q INTERP \
     && ! readelf --dynamic target/container/rusticmq | grep -q NEEDED \

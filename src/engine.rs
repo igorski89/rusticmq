@@ -45,6 +45,8 @@ struct Queue {
     moving: Option<RunningMoveTask>,
     #[serde(skip)]
     previous_moves: Vec<MessageMoveTask>,
+    #[serde(skip)]
+    activity: QueueActivity,
 }
 
 /// Derived indexes are rebuilt lazily after deserialization; SQLite and engine
@@ -234,6 +236,7 @@ impl QueueManager {
                 attempts: BTreeMap::new(),
                 moving: None,
                 previous_moves: Vec::new(),
+                activity: QueueActivity::default(),
             },
         );
         self.events.push(QueueEvent::QueueCreated(config.clone()));
@@ -432,7 +435,10 @@ impl QueueManager {
                 .as_ref()
                 .and_then(|id| queue.deduplication.get(id))
         {
-            return Ok(previous.message.clone());
+            let previous = previous.message.clone();
+            queue.activity.deduplicated += 1;
+            queue.activity.last_send = Some(now);
+            return Ok(previous);
         }
         let message = Message {
             id: request.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
@@ -454,6 +460,9 @@ impl QueueManager {
         };
         self.next_order += 1;
         self.insert_message(name, message.clone())?;
+        let activity = &mut self.get_mut(name)?.activity;
+        activity.sent += 1;
+        activity.last_send = Some(now);
         Ok(message)
     }
 
@@ -518,6 +527,7 @@ impl QueueManager {
         now: Timestamp,
     ) -> Result<Vec<Message>, Error> {
         let queue = self.get_mut(name)?;
+        queue.activity.last_receive = Some(now);
         let cached = request
             .attempt_id
             .as_ref()
@@ -610,6 +620,7 @@ impl QueueManager {
                 .attempts
                 .retain(|_, attempt| after(attempt.cached_at, 900_000) >= now);
         }
+        self.get_mut(name)?.activity.received += result.len() as u64;
         Ok(result)
     }
 
@@ -673,6 +684,7 @@ impl QueueManager {
         let message = message.clone();
         queue.refresh_history(&message);
         queue.remove_message(id);
+        queue.activity.deleted += 1;
         self.events.push(QueueEvent::MessageRemoved {
             queue: name.into(),
             id: id.into(),
@@ -724,6 +736,10 @@ impl QueueManager {
             }
         }
         Ok(stats)
+    }
+
+    pub fn activity(&self, name: &str) -> Result<&QueueActivity, Error> {
+        Ok(&self.get(name)?.activity)
     }
 
     pub fn messages(&self, name: &str) -> Result<Vec<Message>, Error> {

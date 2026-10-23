@@ -178,6 +178,22 @@ pub struct QueueStatistics {
     pub delayed: usize,
 }
 
+/// Per-queue traffic since the process started or the queue was created.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueActivity {
+    /// Messages stored by sends, including copy/move routing into this queue;
+    /// dead-letter and message-move-task arrivals are not sends.
+    pub sent: u64,
+    /// FIFO sends accepted without storing, as duplicates within five minutes.
+    pub deduplicated: u64,
+    pub received: u64,
+    pub deleted: u64,
+    /// Last send addressed to this queue, whether stored or deduplicated.
+    pub last_send: Option<Timestamp>,
+    /// Last receive request, including empty ones and long-poll wakeups.
+    pub last_receive: Option<Timestamp>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StartMoveTask {
     pub source: String,

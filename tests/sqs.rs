@@ -209,6 +209,116 @@ async fn an_oversized_batch_fails_before_any_message_is_sent() {
     );
 }
 
+async fn scrape(app: &Router) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn metrics_report_traffic_deduplication_and_configuration() {
+    let app = SqsService::new(
+        QueueManager::new(),
+        ServerConfig {
+            config_file: Some("/opt/elasticmq.conf".into()),
+            configured_queues: 4,
+            persistent_storage: true,
+            max_content_length: None,
+            ..Default::default()
+        },
+    )
+    .router();
+    let body = scrape(&app).await;
+    assert!(body.contains(&format!(
+        "rusticmq_build_info{{version=\"{}\",commit=\"",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert!(body.contains(
+        "rusticmq_config_info{file=\"/opt/elasticmq.conf\",storage=\"sqlite\",sqs_limits=\"strict\"} 1"
+    ));
+    assert!(body.contains("rusticmq_config_queues 4\n"));
+    assert!(body.contains("rusticmq_config_max_content_length_bytes +Inf\n"));
+
+    let url = ok(
+        &app,
+        "CreateQueue",
+        json!({"QueueName":"traffic.fifo","Attributes":{"FifoQueue":"true"}}),
+    )
+    .await["QueueUrl"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let body = scrape(&app).await;
+    assert!(body.contains("rusticmq_messages_sent_total{queue=\"traffic.fifo\"} 0"));
+    assert!(!body.contains("rusticmq_queue_last_send_timestamp_seconds{"));
+    assert!(!body.contains("rusticmq_queue_last_receive_timestamp_seconds{"));
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    for (body, id) in [("first", "a"), ("again", "a"), ("second", "b")] {
+        ok(
+            &app,
+            "SendMessage",
+            json!({"QueueUrl":url,"MessageBody":body,"MessageGroupId":"g","MessageDeduplicationId":id}),
+        )
+        .await;
+    }
+    let received = ok(
+        &app,
+        "ReceiveMessage",
+        json!({"QueueUrl":url,"MaxNumberOfMessages":10}),
+    )
+    .await;
+    let messages = received["Messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    ok(
+        &app,
+        "DeleteMessage",
+        json!({"QueueUrl":url,"ReceiptHandle":messages[0]["ReceiptHandle"]}),
+    )
+    .await;
+    let empty = ok(&app, "ReceiveMessage", json!({"QueueUrl":url})).await;
+    assert!(empty["Messages"].as_array().is_none_or(Vec::is_empty));
+
+    let body = scrape(&app).await;
+    for expected in [
+        "rusticmq_messages_sent_total{queue=\"traffic.fifo\"} 2",
+        "rusticmq_messages_deduplicated_total{queue=\"traffic.fifo\"} 1",
+        "rusticmq_messages_received_total{queue=\"traffic.fifo\"} 2",
+        "rusticmq_messages_deleted_total{queue=\"traffic.fifo\"} 1",
+        "# TYPE rusticmq_messages_sent_total counter",
+    ] {
+        assert!(body.contains(expected), "{expected} missing from\n{body}");
+    }
+    for metric in [
+        "rusticmq_queue_last_send_timestamp_seconds",
+        "rusticmq_queue_last_receive_timestamp_seconds",
+    ] {
+        let prefix = format!("{metric}{{queue=\"traffic.fifo\"}} ");
+        let value: f64 = body
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            value >= before.floor() && value < before + 60.0,
+            "{metric} {value}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn metrics_report_delayed_messages_and_remove_deleted_queues() {
     let app = app();

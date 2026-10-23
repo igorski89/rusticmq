@@ -130,9 +130,13 @@ using **Linux containers**. Docker builds the Linux executable, so no host Rust
 installation is needed:
 
 ```sh
-docker build --tag rusticmq:local .
+docker build --build-arg RUSTICMQ_COMMIT=$(git rev-parse --short=7 HEAD) --tag rusticmq:local .
 docker run --rm --publish 9324:9324 rusticmq:local
 ```
+
+The build context excludes `.git`, so `RUSTICMQ_COMMIT` supplies the commit that
+`rusticmq_build_info` reports; without it the image reports `unknown`. Native
+builds read the commit from Git.
 
 The multi-stage [Dockerfile](Dockerfile) compiles against musl and uses an empty
 `scratch` runtime. It contains a stripped, statically linked executable, CA
@@ -237,7 +241,7 @@ groups. Results are local measurements, not throughput guarantees.
 After both audits pass, publish a multi-architecture image to the local registry:
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 --tag localhost:5555/igorski89/rusticmq:latest --tag localhost:5555/igorski89/rusticmq:0.1.0 --push .
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg RUSTICMQ_COMMIT=$(git rev-parse --short=7 HEAD) --tag localhost:5555/igorski89/rusticmq:latest --tag localhost:5555/igorski89/rusticmq:0.1.0 --push .
 ```
 
 Both tags point to one manifest index containing the two Linux architectures.
