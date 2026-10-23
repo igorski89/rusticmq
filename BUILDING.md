@@ -241,7 +241,7 @@ groups. Results are local measurements, not throughput guarantees.
 After both audits pass, publish a multi-architecture image to the local registry:
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 --build-arg RUSTICMQ_COMMIT=$(git rev-parse --short=7 HEAD) --tag localhost:5555/igorski89/rusticmq:latest --tag localhost:5555/igorski89/rusticmq:0.2.0 --push .
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg RUSTICMQ_COMMIT=$(git rev-parse --short=7 HEAD) --tag localhost:5555/igorski89/rusticmq:latest --tag localhost:5555/igorski89/rusticmq:0.3.0 --push .
 ```
 
 Both tags point to one manifest index containing the two Linux architectures.
