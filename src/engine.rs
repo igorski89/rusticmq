@@ -463,6 +463,7 @@ impl QueueManager {
         let activity = &mut self.get_mut(name)?.activity;
         activity.sent += 1;
         activity.last_send = Some(now);
+        activity.record_body(message.body.len());
         Ok(message)
     }
 

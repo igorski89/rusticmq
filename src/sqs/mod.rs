@@ -7,7 +7,7 @@ use crate::*;
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, OriginalUri, State},
+    extract::{DefaultBodyLimit, OriginalUri, State, rejection::BytesRejection},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
@@ -134,6 +134,32 @@ pub struct SqsService {
     changed: watch::Sender<u64>,
     stopping: watch::Sender<bool>,
     persistence: Option<Arc<crate::persistence::Persistence>>,
+    too_large: Arc<TooLarge>,
+    started: Timestamp,
+}
+
+/// Request bodies rejected for exceeding `max-content-length`. The action
+/// comes from a client header, so labels are limited to the send actions.
+#[derive(Default)]
+struct TooLarge([std::sync::atomic::AtomicU64; 3]);
+
+impl TooLarge {
+    const ACTIONS: [&str; 3] = ["SendMessage", "SendMessageBatch", "other"];
+
+    fn record(&self, action: &str) {
+        let index = Self::ACTIONS[..2]
+            .iter()
+            .position(|known| *known == action)
+            .unwrap_or(2);
+        self.0[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn counts(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        Self::ACTIONS
+            .into_iter()
+            .zip(&self.0)
+            .map(|(action, count)| (action, count.load(std::sync::atomic::Ordering::Relaxed)))
+    }
 }
 
 impl SqsService {
@@ -147,6 +173,8 @@ impl SqsService {
             changed,
             stopping,
             persistence: None,
+            too_large: Arc::default(),
+            started: now(),
         }
     }
 
@@ -860,6 +888,22 @@ async fn metrics(State(service): State<SqsService>) -> Response {
         )],
     );
     family(
+        "process_start_time_seconds",
+        "gauge",
+        "Start time of the process since the Unix epoch",
+        &[(String::new(), seconds(service.started))],
+    );
+    family(
+        "rusticmq_requests_too_large_total",
+        "counter",
+        "Requests rejected for exceeding max-content-length",
+        &service
+            .too_large
+            .counts()
+            .map(|(action, count)| (format!("{{action=\"{action}\"}}"), count.to_string()))
+            .collect::<Vec<_>>(),
+    );
+    family(
         "rusticmq_config_queues",
         "gauge",
         "Queues defined by the startup configuration",
@@ -950,11 +994,75 @@ async fn metrics(State(service): State<SqsService>) -> Response {
     ] {
         family(name, kind, help, &samples);
     }
+    // `family` appends the label text to the name, so it also carries the
+    // histogram's `_bucket`, `_sum` and `_count` suffixes.
+    let mut histogram = Vec::new();
+    for (labels, _, activity) in &queues {
+        let queue = labels.trim_start_matches('{').trim_end_matches('}');
+        let mut cumulative = 0;
+        for (bound, count) in BODY_BYTES_BUCKETS.iter().zip(activity.body_bytes_buckets) {
+            cumulative += count;
+            histogram.push((
+                format!("_bucket{{{queue},le=\"{bound}\"}}"),
+                cumulative.to_string(),
+            ));
+        }
+        histogram.push((
+            format!("_bucket{{{queue},le=\"+Inf\"}}"),
+            activity.sent.to_string(),
+        ));
+        histogram.push((format!("_sum{labels}"), activity.body_bytes_sum.to_string()));
+        histogram.push((format!("_count{labels}"), activity.sent.to_string()));
+    }
+    family(
+        "rusticmq_message_body_bytes",
+        "histogram",
+        "Sizes of stored message bodies in UTF-8 bytes",
+        &histogram,
+    );
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
     )
         .into_response()
+}
+
+impl SqsService {
+    /// Counts and logs an unreadable body, returning an SQS-style error in
+    /// place of axum's plain-text rejection, which SDKs cannot parse.
+    fn rejected(&self, rejection: BytesRejection, uri: &Uri, headers: &HeaderMap) -> ApiError {
+        let action = headers
+            .get("x-amz-target")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.rsplit('.').next())
+            .map(str::to_owned)
+            .or_else(|| {
+                serde_urlencoded::from_str::<BTreeMap<String, String>>(uri.query()?)
+                    .ok()?
+                    .remove("Action")
+            })
+            .unwrap_or_else(|| "unknown".into());
+        if rejection.status() != StatusCode::PAYLOAD_TOO_LARGE {
+            return ApiError::invalid(rejection.body_text());
+        }
+        self.too_large.record(&action);
+        let length = headers
+            .get("content-length")
+            .and_then(|h| h.to_str().ok())
+            .map_or("unknown".into(), |length| format!("{length} bytes"));
+        let limit = self
+            .config
+            .max_content_length
+            .map_or("unlimited".into(), |bytes| bytes.to_string());
+        eprintln!(
+            "Rejected {action} {}: body of {length} exceeds max-content-length ({limit} bytes)",
+            uri.path()
+        );
+        ApiError::new(
+            "RequestEntityTooLarge",
+            format!("The request body exceeds max-content-length ({limit} bytes)"),
+        )
+    }
 }
 
 fn seconds(millis: Timestamp) -> String {
@@ -973,11 +1081,23 @@ async fn handle(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
     if method == Method::OPTIONS {
         return cors((StatusCode::NO_CONTENT, "").into_response());
     }
+    let json_protocol = headers.contains_key("x-amz-target")
+        || headers
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|h| h.contains("json"));
+    let (body, rejected) = match body {
+        Ok(body) => (body, None),
+        Err(rejection) => (
+            Bytes::new(),
+            Some(service.rejected(rejection, &uri, &headers)),
+        ),
+    };
     if service.config.wildcard_queue_urls {
         let protocol = uri.scheme_str().unwrap_or("http");
         let authority = uri
@@ -995,12 +1115,9 @@ async fn handle(
         let path = path.strip_suffix(&suffix).unwrap_or(path);
         service.config.base_url = format!("{protocol}://{authority}{path}");
     }
-    let json_protocol = headers.contains_key("x-amz-target")
-        || headers
-            .get("content-type")
-            .and_then(|h| h.to_str().ok())
-            .is_some_and(|h| h.contains("json"));
-    let parsed = if json_protocol {
+    let parsed = if let Some(error) = rejected {
+        Err(error)
+    } else if json_protocol {
         let action = headers
             .get("x-amz-target")
             .and_then(|h| h.to_str().ok())
@@ -1062,6 +1179,8 @@ async fn handle(
         Err(error) => (
             if error.code == "InternalError" {
                 StatusCode::INTERNAL_SERVER_ERROR
+            } else if error.code == "RequestEntityTooLarge" {
+                StatusCode::PAYLOAD_TOO_LARGE
             } else {
                 StatusCode::BAD_REQUEST
             },

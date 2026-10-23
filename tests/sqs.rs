@@ -104,20 +104,51 @@ async fn receive_and_lookup_can_auto_create_queues() {
 
 #[tokio::test]
 async fn request_bodies_follow_the_configured_max_content_length() {
-    let body = json!({"QueueUrl":"q","MessageBody":"a".repeat(9 * 1024 * 1024)});
-    let response = app()
+    let app = app();
+    let body = "a".repeat(9 * 1024 * 1024);
+    let (status, error) = call(
+        &app,
+        "SendMessage",
+        json!({"QueueUrl":"q","MessageBody":body}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(error["__type"], "com.amazonaws.sqs#RequestEntityTooLarge");
+    assert_eq!(
+        error["Message"],
+        "The request body exceeds max-content-length (8388608 bytes)"
+    );
+    let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/")
-                .header("x-amz-target", "AmazonSQS.SendMessage")
-                .header("content-type", "application/x-amz-json-1.0")
-                .body(Body::from(body.to_string()))
+                .uri("/?Action=SendMessageBatch")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!("MessageBody={body}")))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let xml = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        std::str::from_utf8(&xml)
+            .unwrap()
+            .contains("<Code>RequestEntityTooLarge</Code>")
+    );
+    call(&app, "CreateQueue", json!({"QueueName":body})).await;
+    let metrics = scrape(&app).await;
+    for expected in [
+        "rusticmq_requests_too_large_total{action=\"SendMessage\"} 1",
+        "rusticmq_requests_too_large_total{action=\"SendMessageBatch\"} 1",
+        "rusticmq_requests_too_large_total{action=\"other\"} 1",
+    ] {
+        assert!(
+            metrics.contains(expected),
+            "{expected} missing from\n{metrics}"
+        );
+    }
     let app = SqsService::new(
         QueueManager::new(),
         ServerConfig {
@@ -246,6 +277,18 @@ async fn metrics_report_traffic_deduplication_and_configuration() {
         "rusticmq_config_info{file=\"/opt/elasticmq.conf\",storage=\"sqlite\",sqs_limits=\"strict\"} 1"
     ));
     assert!(body.contains("rusticmq_config_queues 4\n"));
+    let started: f64 = body
+        .lines()
+        .find_map(|line| line.strip_prefix("process_start_time_seconds "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        - started;
+    assert!((0.0..60.0).contains(&elapsed), "started {elapsed} s ago");
     assert!(body.contains("rusticmq_config_max_content_length_bytes +Inf\n"));
 
     let url = ok(
@@ -298,6 +341,11 @@ async fn metrics_report_traffic_deduplication_and_configuration() {
         "rusticmq_messages_received_total{queue=\"traffic.fifo\"} 2",
         "rusticmq_messages_deleted_total{queue=\"traffic.fifo\"} 1",
         "# TYPE rusticmq_messages_sent_total counter",
+        "# TYPE rusticmq_message_body_bytes histogram",
+        "rusticmq_message_body_bytes_bucket{queue=\"traffic.fifo\",le=\"1024\"} 2",
+        "rusticmq_message_body_bytes_bucket{queue=\"traffic.fifo\",le=\"+Inf\"} 2",
+        "rusticmq_message_body_bytes_sum{queue=\"traffic.fifo\"} 11",
+        "rusticmq_message_body_bytes_count{queue=\"traffic.fifo\"} 2",
     ] {
         assert!(body.contains(expected), "{expected} missing from\n{body}");
     }

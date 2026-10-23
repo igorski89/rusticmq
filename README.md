@@ -43,6 +43,8 @@ queues {
 
 As in ElasticMQ, `pekko.http.server.parsing.max-content-length` sets the request
 body limit as a HOCON size, such as `500m`, or `infinite`. The default is `8m`.
+A larger request gets HTTP 413 with the SQS error `RequestEntityTooLarge`, which
+SDKs report as a normal client error, and RusticMQ logs the rejection.
 Set it together with `rest-sqs.sqs-limits = relaxed` to accept messages larger
 than the SQS limit.
 
@@ -96,8 +98,11 @@ Additional environment variables configure the server:
 | `rusticmq_messages_deleted_total` | counter | Messages deleted by receipt handle |
 | `rusticmq_queue_last_send_timestamp_seconds` | gauge | Last send, stored or deduplicated |
 | `rusticmq_queue_last_receive_timestamp_seconds` | gauge | Last receive request, including empty receives |
+| `rusticmq_message_body_bytes` | histogram | Stored message body sizes, buckets from 1 KiB to 256 MiB |
 
-For the server: `rusticmq_build_info{version,commit}`,
+For the server: `process_start_time_seconds`,
+`rusticmq_requests_too_large_total{action}` (requests over the body limit, by
+`SendMessage`, `SendMessageBatch` or `other`), `rusticmq_build_info{version,commit}`,
 `rusticmq_config_info{file,storage,sqs_limits}`, `rusticmq_config_queues` (queues
 defined by the configuration) and `rusticmq_config_max_content_length_bytes`
 (`+Inf` when unlimited). Counters and timestamps start when the process starts or

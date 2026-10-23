@@ -192,6 +192,34 @@ pub struct QueueActivity {
     pub last_send: Option<Timestamp>,
     /// Last receive request, including empty ones and long-poll wakeups.
     pub last_receive: Option<Timestamp>,
+    /// Stored message bodies per `BODY_BYTES_BUCKETS` upper bound (UTF-8
+    /// bytes); larger bodies count only in `sent` and `body_bytes_sum`.
+    pub body_bytes_buckets: [u64; BODY_BYTES_BUCKETS.len()],
+    pub body_bytes_sum: u64,
+}
+
+/// Upper bounds for the message body size histogram, 1 KiB to 256 MiB.
+pub const BODY_BYTES_BUCKETS: [u64; 10] = [
+    1 << 10,
+    4 << 10,
+    16 << 10,
+    64 << 10,
+    256 << 10,
+    1 << 20,
+    4 << 20,
+    16 << 20,
+    64 << 20,
+    256 << 20,
+];
+
+impl QueueActivity {
+    pub(crate) fn record_body(&mut self, bytes: usize) {
+        let bytes = bytes as u64;
+        self.body_bytes_sum = self.body_bytes_sum.saturating_add(bytes);
+        if let Some(bucket) = BODY_BYTES_BUCKETS.iter().position(|bound| bytes <= *bound) {
+            self.body_bytes_buckets[bucket] += 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
