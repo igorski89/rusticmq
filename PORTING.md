@@ -101,6 +101,20 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
+## 0.3.0 Docker publication
+
+The images from release commit `81751e3` are published to
+`localhost:5555/igorski89/rusticmq:latest`, `:0.3.0` and `:81751e3`. All three
+tags point to the same AMD64/ARM64 manifest index:
+
+```text
+sha256:802d6af562e7bbb78255069a83e667ab9c06c504eb97a136996951c27472bdde
+```
+
+Both architectures passed a smoke test against the published image. The full
+Docker audit described above has not been rerun since 0.1.0. `:latest` has moved
+on from the digests recorded in the sections below, which are kept as history.
+
 ## Review-fix Docker publication
 
 The images from review-fix commit `9679a14` were published to
