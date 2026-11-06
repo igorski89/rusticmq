@@ -30,7 +30,7 @@ class ContainerTests(unittest.TestCase):
         try:
             for generation in range(3):
                 options = ["--platform", platform] if platform else []
-                container = docker("run", *options, "--detach", "--rm", "--publish", "127.0.0.1::9324",
+                container = docker("run", *options, "--detach", "--publish", "127.0.0.1::9324",
                     "--mount", f"type=volume,source={volume},target=/data",
                     image, "--data-dir", "/data")
                 address = docker("port", container, "9324/tcp").splitlines()[0]
@@ -64,11 +64,14 @@ class ContainerTests(unittest.TestCase):
                         self.assertEqual(set(attributes.values()), {"0"})
                     if generation == 1:
                         client.delete_message(QueueUrl=url, ReceiptHandle=message["ReceiptHandle"])
+                # Removed explicitly rather than with --rm: `docker stop` returns
+                # before --rm finishes, so the volume could still be in use.
                 docker("stop", container)
+                docker("rm", container)
                 container = None
         finally:
             if container:
-                docker("stop", container)
+                docker("rm", "--force", container)
             docker("volume", "rm", volume)
 
 
