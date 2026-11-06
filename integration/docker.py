@@ -18,7 +18,7 @@ from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_TESTS = {"rust": 69, "aws_sdk": 14, "query": 3, "restart": 5, "container": 1,
+EXPECTED_TESTS = {"rust": 74, "aws_sdk": 14, "query": 3, "restart": 5, "container": 1,
     "upstream_java": 150, "upstream_node": 5}
 
 
