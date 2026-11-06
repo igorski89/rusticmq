@@ -1,7 +1,9 @@
 # Building RusticMQ
 
 Build from the repository root with the current stable Rust toolchain. A C
-compiler is required because SQLite is compiled into the executable. There is no
+compiler is required because SQLite is compiled into the executable. On macOS
+and Linux, `make` is also required for jemalloc, the executable's memory
+allocator; Windows (MSVC) builds use the system allocator. There is no
 separate SQLite installation or Java/Scala requirement for building or running
 RusticMQ. Java and Node.js are only needed for the optional upstream SDK tests.
 
@@ -139,7 +141,7 @@ The build context excludes `.git`, so `RUSTICMQ_COMMIT` supplies the commit that
 builds read the commit from Git.
 
 The multi-stage [Dockerfile](Dockerfile) compiles against musl and uses an empty
-`scratch` runtime. It contains a stripped, statically linked executable, CA
+`scratch` runtime. It contains a stripped, statically linked executable using jemalloc, CA
 certificates for HTTPS configuration includes, license notices, a writable `/data`
 directory and `/tmp`. It runs as UID/GID `10001:10001`, with no shell, package
 manager, compiler or shared libraries. The `container` Cargo profile optimizes

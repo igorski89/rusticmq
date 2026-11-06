@@ -20,6 +20,16 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# jemalloc does not build with MSVC; Windows keeps the system allocator.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[features]
+default = ["jemalloc"]
+# Allocator for the rusticmq executable only. The library sets no global
+# allocator, so embedding applications can disable default features.
+jemalloc = ["dep:tikv-jemallocator"]
+
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
