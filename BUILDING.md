@@ -143,7 +143,7 @@ The multi-stage [Dockerfile](Dockerfile) compiles against musl and uses an empty
 certificates for HTTPS configuration includes, license notices, a writable `/data`
 directory and `/tmp`. It runs as UID/GID `10001:10001`, with no shell, package
 manager, compiler or shared libraries. The `container` Cargo profile optimizes
-size with LTO and aborts on panic; ordinary native release builds keep Cargo's
+for speed with LTO, strips symbols and aborts on panic; ordinary native release builds keep Cargo's
 normal release settings.
 
 For durable storage, use a named volume:
