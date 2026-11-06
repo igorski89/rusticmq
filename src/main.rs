@@ -69,12 +69,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     eprintln!("RusticMQ listening on {}", listener.local_addr()?);
     let service = SqsService::new(manager, config).with_persistence(persistence);
+    let stopping = service.clone();
     axum::serve(listener, service.clone().router())
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            service.shutdown();
+            stopping.shutdown();
         })
         .await?;
+    if let Err(error) = service.flush().await {
+        eprintln!("Persistence failed during shutdown: {error}");
+    }
     Ok(())
 }
 

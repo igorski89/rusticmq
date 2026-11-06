@@ -101,7 +101,8 @@ Additional environment variables configure the server:
 | `rusticmq_message_body_bytes` | histogram | Stored message body sizes, buckets from 1 KiB to 256 MiB |
 
 For the server: `process_start_time_seconds`,
-`rusticmq_requests_too_large_total{action}` (requests over the body limit, by
+`rusticmq_persistence_errors_total` (failed database commit attempts; alert on any
+increase), `rusticmq_requests_too_large_total{action}` (requests over the body limit, by
 `SendMessage`, `SendMessageBatch` or `other`), `rusticmq_build_info{version,commit}`,
 `rusticmq_config_info{file,storage,sqs_limits}`, `rusticmq_config_queues` (queues
 defined by the configuration) and `rusticmq_config_max_content_length_bytes`

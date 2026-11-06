@@ -54,10 +54,17 @@ HOCON parser has a documented fix for trailing indented whitespace in
 DLQ configuration rejects mismatched FIFO modes and dependency cycles before
 mutation. Rejected DLQ delivery no longer aborts receives, matching upstream's
 best-effort source removal. Move workers start even if their initial persistence
-flush fails; they retry pending events before moving messages. A failed commit
-returns an error while keeping the in-memory mutation and pending events for
-retry; callers should account for that when retrying requests. Shutdown wakes
+flush fails; they retry pending events before moving messages. Shutdown wakes
 long polls, including requests above 20 seconds in relaxed mode.
+
+One writer thread commits engine events in order, grouping waiting requests into
+one transaction and one `fsync`. Requests release the engine lock first and answer
+only after the commit, including requests that changed nothing, such as a FIFO
+duplicate of a message not yet durable. A failed commit answers every request in
+its group with `InternalError`, logs a line and increments
+`rusticmq_persistence_errors_total`. The in-memory mutations and pending events
+stay, and the writer retries them before later work, so callers should account for
+that when retrying requests.
 
 Derived ordered delivery indexes replace sorting all messages on each receive.
 They track insertion, replacement, deletion and visibility updates, and rebuild

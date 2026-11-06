@@ -1211,3 +1211,148 @@ async fn long_poll_wakes_at_delayed_delivery_without_another_request() {
     .unwrap();
     assert_eq!(response["Messages"][0]["Body"], "delayed");
 }
+
+fn durable_service(root: &std::path::Path) -> (SqsService, std::path::PathBuf) {
+    use rusticmq::{CreateQueue, persistence::Persistence};
+    let path = root.join("rusticmq.sqlite");
+    let store = Persistence::open(None, Some(path.clone()), false).unwrap();
+    let mut manager = QueueManager::new();
+    manager.create_queue(CreateQueue::named("jobs"), 0).unwrap();
+    let mut fifo = CreateQueue::named("jobs.fifo");
+    fifo.fifo = true;
+    manager.create_queue(fifo, 0).unwrap();
+    store.apply(&manager.drain_events(), &manager).unwrap();
+    (
+        SqsService::new(manager, ServerConfig::default()).with_persistence(store),
+        path,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_wait_for_their_commit_without_blocking_the_engine() {
+    let root = tempfile::tempdir().unwrap();
+    let (service, path) = durable_service(root.path());
+    let app = service.clone().router();
+    let url = "http://localhost:9324/000000000000/jobs.fifo";
+    let send = |app: Router| async move {
+        call(
+            &app,
+            "SendMessage",
+            json!({"QueueUrl":url,"MessageBody":"once","MessageGroupId":"g","MessageDeduplicationId":"d"}),
+        )
+        .await
+    };
+    // Hold SQLite's write lock from another connection, so commits cannot finish.
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let original = tokio::spawn(send(app.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!original.is_finished(), "acknowledged before its commit");
+    // The engine stays available while the commit waits for the disk.
+    assert_eq!(
+        service
+            .manager
+            .try_lock()
+            .unwrap()
+            .messages("jobs.fifo")
+            .unwrap()
+            .len(),
+        1
+    );
+    // A duplicate stores nothing, but its answer relies on the original.
+    let duplicate = tokio::spawn(send(app.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!duplicate.is_finished(), "duplicate acknowledged early");
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    let original = original.await.unwrap();
+    let duplicate = duplicate.await.unwrap();
+    assert_eq!(original.0, StatusCode::OK);
+    assert_eq!(duplicate.0, StatusCode::OK);
+    assert_eq!(original.1["MessageId"], duplicate.1["MessageId"]);
+    let stored: i64 = blocker
+        .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_group_commit_fails_its_requests_and_is_retried_in_order() {
+    use rusticmq::persistence::Persistence;
+    let root = tempfile::tempdir().unwrap();
+    let (service, path) = durable_service(root.path());
+    let app = service.clone().router();
+    let url = "http://localhost:9324/000000000000/jobs";
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute_batch("CREATE TRIGGER fail BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk trouble'); END")
+        .unwrap();
+
+    let sends: Vec<_> = (0..20)
+        .map(|index| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                call(
+                    &app,
+                    "SendMessage",
+                    json!({"QueueUrl":url,"MessageBody":format!("m{index}")}),
+                )
+                .await
+            })
+        })
+        .collect();
+    for send in sends {
+        let (status, error) = send.await.unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error["__type"], "com.amazonaws.sqs#InternalError");
+        assert!(error["Message"].as_str().unwrap().contains("disk trouble"));
+    }
+    let metrics = scrape(&app).await;
+    let failures: u64 = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("rusticmq_persistence_errors_total "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(failures >= 1);
+    // Later requests also fail while earlier changes are not durable.
+    assert_eq!(
+        call(
+            &app,
+            "GetQueueAttributes",
+            json!({"QueueUrl":url,"AttributeNames":["All"]})
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    // The disk recovers: the writer retries by itself, with no new request.
+    database.execute_batch("DROP TRIGGER fail").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let stored: i64 = database
+                .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+                .unwrap();
+            if stored == 20 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    ok(
+        &app,
+        "SendMessage",
+        json!({"QueueUrl":url,"MessageBody":"after"}),
+    )
+    .await;
+
+    let restored = Persistence::open(None, Some(path), false)
+        .unwrap()
+        .restore(vec![], 0)
+        .unwrap();
+    assert_eq!(restored.messages("jobs").unwrap().len(), 21);
+}

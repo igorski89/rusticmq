@@ -20,9 +20,29 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, oneshot, watch};
 
 type ApiResult<T> = Result<T, ApiError>;
+
+/// A request's commit. Await it after releasing the manager, and before
+/// answering: nothing is acknowledged until its changes are durable.
+#[must_use]
+enum Commit {
+    Settled(ApiResult<()>),
+    Pending(oneshot::Receiver<crate::persistence::CommitResult>),
+}
+
+impl Commit {
+    async fn wait(self) -> ApiResult<()> {
+        match self {
+            Self::Settled(result) => result,
+            Self::Pending(result) => match result.await {
+                Ok(result) => result.map_err(|error| ApiError::new("InternalError", error)),
+                Err(_) => Err(ApiError::new("InternalError", "Database writer stopped")),
+            },
+        }
+    }
+}
 
 #[derive(Debug)]
 struct ApiError {
@@ -133,7 +153,7 @@ pub struct SqsService {
     pub config: ServerConfig,
     changed: watch::Sender<u64>,
     stopping: watch::Sender<bool>,
-    persistence: Option<Arc<crate::persistence::Persistence>>,
+    writer: Option<crate::persistence::Writer>,
     too_large: Arc<TooLarge>,
     started: Timestamp,
 }
@@ -172,7 +192,7 @@ impl SqsService {
             config,
             changed,
             stopping,
-            persistence: None,
+            writer: None,
             too_large: Arc::default(),
             started: now(),
         }
@@ -195,8 +215,17 @@ impl SqsService {
     }
 
     pub fn with_persistence(mut self, persistence: crate::persistence::Persistence) -> Self {
-        self.persistence = Some(Arc::new(persistence));
+        self.writer = Some(crate::persistence::Writer::spawn(persistence));
         self
+    }
+
+    /// Commit anything still outstanding, for use after the HTTP server stops.
+    pub async fn flush(&self) -> Result<(), String> {
+        let commit = {
+            let mut manager = self.manager.lock().await;
+            self.notify_change(&mut manager)
+        };
+        commit.wait().await.map_err(|error| error.message)
     }
 
     /// Finish outstanding long polls before the HTTP server drains connections.
@@ -252,9 +281,14 @@ impl SqsService {
         if action == "ReceiveMessage" {
             return self.receive(&request).await;
         }
-        let mut manager = self.manager.lock().await;
-        let result = self.dispatch(&mut manager, action, &request, tracing, now());
-        let persisted = self.notify_change(&mut manager);
+        let (result, commit) = {
+            let mut manager = self.manager.lock().await;
+            let result = self.dispatch(&mut manager, action, &request, tracing, now());
+            let commit = self.notify_change(&mut manager);
+            (result, commit)
+        };
+        // Start the worker before waiting: a client disconnecting during the
+        // wait cancels this request, but the task has already been accepted.
         if action == "StartMessageMoveTask"
             && let Ok(value) = &result
             && let Some(handle) = value["TaskHandle"].as_str()
@@ -265,44 +299,57 @@ impl SqsService {
                 service.run_move_task(handle).await;
             });
         }
-        persisted?;
+        commit.wait().await?;
         result
     }
 
-    fn notify_change(&self, manager: &mut QueueManager) -> ApiResult<()> {
+    /// Hand the engine's events to the database writer, while holding the
+    /// manager so that commit order matches engine order.
+    fn notify_change(&self, manager: &mut QueueManager) -> Commit {
         let events = manager.drain_events();
-        if let Some(persistence) = &self.persistence
-            && let Err(error) = persistence.apply(&events, manager)
-        {
-            manager.requeue_events(events);
-            return Err(ApiError::new("InternalError", error.to_string()));
-        }
-        if !events.is_empty() {
+        let changed = !events.is_empty();
+        let commit = match &self.writer {
+            None => Commit::Settled(Ok(())),
+            Some(writer) => match writer.submit(events, manager) {
+                Ok(Some(result)) => Commit::Pending(result),
+                Ok(None) => Commit::Settled(Ok(())),
+                Err((events, error)) => {
+                    eprintln!("Persistence submit failed: {error}");
+                    manager.requeue_events(events);
+                    return Commit::Settled(Err(ApiError::new("InternalError", error.to_string())));
+                }
+            },
+        };
+        if changed {
             self.changed
                 .send_modify(|version| *version = version.wrapping_add(1));
         }
-        Ok(())
+        commit
     }
 
     async fn run_move_task(&self, handle: String) {
         loop {
-            let step = {
+            // Earlier changes must be durable before more messages move.
+            let pending = {
                 let mut manager = self.manager.lock().await;
-                if let Err(error) = self.notify_change(&mut manager) {
-                    eprintln!("Message move task {handle} persistence: {}", error.message);
-                    drop(manager);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-                let step = manager.step_move_task(&handle, now());
-                if let Err(error) = self.notify_change(&mut manager) {
-                    eprintln!("Message move task {handle} persistence: {}", error.message);
-                    drop(manager);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-                step
+                self.notify_change(&mut manager)
             };
+            if let Err(error) = pending.wait().await {
+                eprintln!("Message move task {handle} persistence: {}", error.message);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            let (step, commit) = {
+                let mut manager = self.manager.lock().await;
+                let step = manager.step_move_task(&handle, now());
+                let commit = self.notify_change(&mut manager);
+                (step, commit)
+            };
+            if let Err(error) = commit.wait().await {
+                eprintln!("Message move task {handle} persistence: {}", error.message);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
             match step {
                 Ok(Some(delay)) if delay.is_zero() => tokio::task::yield_now().await,
                 Ok(Some(delay)) => tokio::time::sleep(delay).await,
@@ -729,12 +776,13 @@ impl SqsService {
         } else {
             None
         };
-        let wait_default = {
+        let (wait_default, commit) = {
             let mut manager = self.manager.lock().await;
             self.ensure_queue(&mut manager, &name, now())?;
-            self.notify_change(&mut manager)?;
-            manager.queue(&name)?.receive_wait_ms / 1000
+            let commit = self.notify_change(&mut manager);
+            (manager.queue(&name)?.receive_wait_ms / 1000, commit)
         };
+        commit.wait().await?;
         let wait = integer(p, "WaitTimeSeconds", Some(wait_default), self.wait_limit())?;
         let attempt_id = optional(p, "ReceiveRequestAttemptId")?.map(str::to_owned);
         let request = ReceiveMessages {
@@ -757,12 +805,14 @@ impl SqsService {
             if *stopping.borrow() {
                 return Ok(json!({"Messages":[]}));
             }
-            let (messages, next_delivery) = {
+            let (messages, next_delivery, commit) = {
                 let mut manager = self.manager.lock().await;
                 let messages = manager.receive_messages(&name, request.clone(), now());
-                self.notify_change(&mut manager)?;
-                (messages?, manager.next_delivery(&name)?)
+                let commit = self.notify_change(&mut manager);
+                (messages, manager.next_delivery(&name), commit)
             };
+            commit.wait().await?;
+            let (messages, next_delivery) = (messages?, next_delivery?);
             if !messages.is_empty() || tokio::time::Instant::now() >= deadline {
                 return Ok(
                     json!({"Messages": messages.iter().map(|m| self.received(m, &system_names, &attribute_names)).collect::<Vec<_>>()}),
@@ -892,6 +942,19 @@ async fn metrics(State(service): State<SqsService>) -> Response {
         "gauge",
         "Start time of the process since the Unix epoch",
         &[(String::new(), seconds(service.started))],
+    );
+    family(
+        "rusticmq_persistence_errors_total",
+        "counter",
+        "Failed database commit attempts, each failing every request in its group",
+        &[(
+            String::new(),
+            service
+                .writer
+                .as_ref()
+                .map_or(0, |writer| writer.errors())
+                .to_string(),
+        )],
     );
     family(
         "rusticmq_requests_too_large_total",
