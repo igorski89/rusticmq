@@ -12,7 +12,7 @@ bigdecimal = "0.4"
 hocon = { version = "0.9", path = "vendor/hocon" }
 rusqlite = { version = "0.38", features = ["bundled"] }
 md-5 = "0.10"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
 sha2 = "0.10"

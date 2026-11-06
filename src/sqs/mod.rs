@@ -7,8 +7,16 @@ use crate::*;
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, OriginalUri, State, rejection::BytesRejection},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    extract::{
+        DefaultBodyLimit, FromRequest, OriginalUri, Request, State, rejection::BytesRejection,
+    },
+    http::{
+        HeaderMap, HeaderValue, Method, StatusCode, Uri,
+        header::{
+            ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+            ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE,
+        },
+    },
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -150,7 +158,8 @@ impl ServerConfig {
 #[derive(Clone)]
 pub struct SqsService {
     pub manager: Arc<Mutex<QueueManager>>,
-    pub config: ServerConfig,
+    /// Shared: axum clones the service for every request.
+    pub config: Arc<ServerConfig>,
     changed: watch::Sender<u64>,
     stopping: watch::Sender<bool>,
     writer: Option<crate::persistence::Writer>,
@@ -189,7 +198,7 @@ impl SqsService {
         let (stopping, _) = watch::channel(false);
         Self {
             manager: Arc::new(Mutex::new(manager)),
-            config,
+            config: Arc::new(config),
             changed,
             stopping,
             writer: None,
@@ -281,6 +290,9 @@ impl SqsService {
         if action == "ReceiveMessage" {
             return self.receive(&request).await;
         }
+        if action == "SendMessage" || action == "SendMessageBatch" {
+            return self.send(action, request, tracing).await;
+        }
         let (result, commit) = {
             let mut manager = self.manager.lock().await;
             let result = self.dispatch(&mut manager, action, &request, tracing, now());
@@ -362,6 +374,134 @@ impl SqsService {
         }
     }
 
+    /// Send without holding the engine lock for parsing, validation, digests
+    /// or the response; only queue lookups and the engine mutation run under it.
+    async fn send(
+        &self,
+        action: &str,
+        request: Value,
+        tracing: Option<String>,
+    ) -> ApiResult<Value> {
+        let (result, commit) = if action == "SendMessage" {
+            let name = queue_name(&request, &self.config.context_path);
+            let prepared = name
+                .is_ok()
+                .then(|| prepare_send(&request, tracing, self.config.relaxed_limits));
+            let mut manager = self.manager.lock().await;
+            let now = now();
+            let result = name.and_then(|name| {
+                self.ensure_queue(&mut manager, &name, now)?;
+                let prepared = prepared.expect("prepared with the queue name");
+                self.send_prepared(&mut manager, &name, prepared, now)
+            });
+            (
+                result.map(Sent::into_json),
+                self.notify_change(&mut manager),
+            )
+        } else {
+            let prepared = self.prepare_send_batch(&request, tracing);
+            let mut manager = self.manager.lock().await;
+            let now = now();
+            let result = match &prepared.name {
+                Ok(name) => self.ensure_queue(&mut manager, name, now),
+                Err(_) => Ok(()),
+            }
+            .and_then(|()| self.send_batch_prepared(&mut manager, prepared, now));
+            (
+                result.map(SentBatch::into_json),
+                self.notify_change(&mut manager),
+            )
+        };
+        commit.wait().await?;
+        result
+    }
+
+    fn prepare_send_batch(&self, p: &Value, tracing: Option<String>) -> PreparedBatch {
+        let relaxed = self.config.relaxed_limits;
+        let name = queue_name(p, &self.config.context_path);
+        let entries = batch_entries(p, "SendMessageBatch", relaxed).map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["Id"].clone(),
+                        prepare_send(entry, tracing.clone(), relaxed),
+                    )
+                })
+                .collect()
+        });
+        PreparedBatch { name, entries }
+    }
+
+    fn send_batch_prepared(
+        &self,
+        manager: &mut QueueManager,
+        prepared: PreparedBatch,
+        now: Timestamp,
+    ) -> ApiResult<SentBatch> {
+        let name = prepared.name?;
+        manager.queue(&name)?;
+        let entries = prepared.entries?;
+        Ok(SentBatch(
+            entries
+                .into_iter()
+                .map(|(id, entry)| {
+                    let result = self.send_prepared(manager, &name, entry, now);
+                    (id, result)
+                })
+                .collect(),
+        ))
+    }
+
+    fn send_prepared(
+        &self,
+        manager: &mut QueueManager,
+        name: &str,
+        prepared: PreparedSend,
+        now: Timestamp,
+    ) -> ApiResult<Sent> {
+        let fifo = manager.queue(name)?.fifo;
+        let (body, attributes) = prepared.content?;
+        let (group_id, deduplication_id) = prepared.ids?;
+        if fifo && group_id.is_none() {
+            return Err(ApiError::new(
+                "MissingParameter",
+                "MessageGroupId is required",
+            ));
+        }
+        if !fifo && deduplication_id.is_some() {
+            return Err(ApiError::invalid(
+                "MessageDeduplicationId is only valid for FIFO queues",
+            ));
+        }
+        let delay = prepared.delay?;
+        if fifo && delay.is_some_and(|seconds| seconds > 0) {
+            return Err(ApiError::invalid(
+                "The request includes parameter DelaySeconds that is not valid for this queue type",
+            ));
+        }
+        let tracing_id = prepared.tracing?;
+        let message = manager.send_message(
+            name,
+            SendMessage {
+                body,
+                attributes,
+                group_id,
+                deduplication_id,
+                delay_ms: delay.filter(|_| !fifo).map(|seconds| seconds * 1000),
+                tracing_id,
+                ..Default::default()
+            },
+            now,
+        )?;
+        Ok(Sent {
+            id: message.id,
+            sequence_number: message.sequence_number,
+            body_digest: prepared.body_digest,
+            attribute_digest: prepared.attribute_digest,
+        })
+    }
+
     fn dispatch(
         &self,
         manager: &mut QueueManager,
@@ -425,59 +565,15 @@ impl SqsService {
                 Ok(json!({"QueueUrl": self.config.queue_url(name)}))
             }
             "AddPermission" | "RemovePermission" => Ok(json!({})),
-            "SendMessageBatch" | "DeleteMessageBatch" | "ChangeMessageVisibilityBatch" => {
+            "SendMessageBatch" => {
+                let prepared = self.prepare_send_batch(p, tracing);
+                self.send_batch_prepared(manager, prepared, now)
+                    .map(SentBatch::into_json)
+            }
+            "DeleteMessageBatch" | "ChangeMessageVisibilityBatch" => {
                 let name = queue_name(p, &self.config.context_path)?;
                 manager.queue(&name)?;
-                let entries = p
-                    .get("Entries")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| ApiError::new("MissingParameter", "Entries is required"))?;
-                if entries.is_empty() {
-                    return Err(ApiError::new(
-                        "EmptyBatchRequest",
-                        "Batch must contain entries",
-                    ));
-                }
-                if !self.config.relaxed_limits && entries.len() > 10 {
-                    return Err(ApiError::new(
-                        "TooManyEntriesInBatchRequest",
-                        "Batch cannot exceed 10 entries",
-                    ));
-                }
-                let mut ids = BTreeSet::new();
-                for entry in entries {
-                    let id = required(entry, "Id")?;
-                    if id.is_empty()
-                        || id.len() > 80
-                        || !id
-                            .bytes()
-                            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-                    {
-                        return Err(ApiError::new(
-                            "InvalidBatchEntryId",
-                            "Invalid batch entry ID",
-                        ));
-                    }
-                    if !ids.insert(id) {
-                        return Err(ApiError::new(
-                            "BatchEntryIdsNotDistinct",
-                            "Batch entry IDs must be distinct",
-                        ));
-                    }
-                }
-                if action == "SendMessageBatch" && !self.config.relaxed_limits {
-                    let mut length = 0usize;
-                    for entry in entries {
-                        length = length
-                            .saturating_add(required(entry, "MessageBody")?.encode_utf16().count());
-                    }
-                    if length > 1024 * 1024 {
-                        return Err(ApiError::new(
-                            "InvalidAttributeValue",
-                            "Batch message bodies exceed the maximum length",
-                        ));
-                    }
-                }
+                let entries = batch_entries(p, action, self.config.relaxed_limits)?;
                 let mut successful = Vec::new();
                 let mut failed = Vec::new();
                 for entry in entries {
@@ -520,92 +616,9 @@ impl SqsService {
             }
             "SendMessage" => {
                 let name = queue_name(p, &self.config.context_path)?;
-                let config = manager.queue(&name)?.clone();
-                let body = required(p, "MessageBody")?;
-                validate_text(body, self.config.relaxed_limits)?;
-                let attributes = parse_message_attributes(
-                    p.get("MessageAttributes"),
-                    self.config.relaxed_limits,
-                )?;
-                if !self.config.relaxed_limits && attributes.len() > 10 {
-                    return Err(ApiError::new(
-                        "InvalidAttributeValue",
-                        "At most 10 message attributes are allowed",
-                    ));
-                }
-                let group_id = optional(p, "MessageGroupId")?.map(str::to_owned);
-                let deduplication_id = optional(p, "MessageDeduplicationId")?.map(str::to_owned);
-                for (parameter, id) in [
-                    ("MessageGroupId", &group_id),
-                    ("MessageDeduplicationId", &deduplication_id),
-                ] {
-                    let Some(id) = id else {
-                        continue;
-                    };
-                    if id.is_empty() || id.len() > 128 || !id.bytes().all(|c| c.is_ascii_graphic())
-                    {
-                        return Err(ApiError::invalid(format!(
-                            "{parameter} can only include alphanumeric and punctuation characters. 1 to 128 in length."
-                        )));
-                    }
-                }
-                if config.fifo && group_id.is_none() {
-                    return Err(ApiError::new(
-                        "MissingParameter",
-                        "MessageGroupId is required",
-                    ));
-                }
-                if !config.fifo && deduplication_id.is_some() {
-                    return Err(ApiError::invalid(
-                        "MessageDeduplicationId is only valid for FIFO queues",
-                    ));
-                }
-                let delay = if p.get("DelaySeconds").is_some() {
-                    Some(integer(p, "DelaySeconds", None, 900)?)
-                } else {
-                    None
-                };
-                if config.fifo && delay.is_some_and(|seconds| seconds > 0) {
-                    return Err(ApiError::invalid(
-                        "The request includes parameter DelaySeconds that is not valid for this queue type",
-                    ));
-                }
-                let system = parse_message_attributes(
-                    p.get("MessageSystemAttributes"),
-                    self.config.relaxed_limits,
-                )?;
-                let tracing_id = match system.get("AWSTraceHeader") {
-                    Some(MessageAttribute {
-                        value: AttributeValue::String(value),
-                        ..
-                    }) => Some(value.clone()),
-                    Some(_) => return Err(ApiError::invalid("AWSTraceHeader must be a String")),
-                    None => tracing,
-                };
-                let body_digest = digest::body_digest(body);
-                let attribute_digest =
-                    (!attributes.is_empty()).then(|| digest::attribute_digest(&attributes));
-                let message = manager.send_message(
-                    &name,
-                    SendMessage {
-                        body: body.into(),
-                        attributes,
-                        group_id,
-                        deduplication_id,
-                        delay_ms: delay.filter(|_| !config.fifo).map(|seconds| seconds * 1000),
-                        tracing_id,
-                        ..Default::default()
-                    },
-                    now,
-                )?;
-                let mut result = json!({"MessageId":message.id, "MD5OfMessageBody":body_digest});
-                if let Some(digest) = attribute_digest {
-                    result["MD5OfMessageAttributes"] = json!(digest);
-                }
-                if let Some(sequence) = message.sequence_number {
-                    result["SequenceNumber"] = json!(sequence);
-                }
-                Ok(result)
+                let prepared = prepare_send(p, tracing, self.config.relaxed_limits);
+                self.send_prepared(manager, &name, prepared, now)
+                    .map(Sent::into_json)
             }
             "GetQueueAttributes" => {
                 let name = queue_name(p, &self.config.context_path)?;
@@ -839,30 +852,39 @@ impl SqsService {
         system_names: &[String],
         attribute_names: &[String],
     ) -> Value {
-        let mut system = BTreeMap::from([
-            ("SentTimestamp", message.created.to_string()),
-            ("ApproximateReceiveCount", message.receive_count.to_string()),
+        // Build only the requested system attributes; most receives ask for none.
+        let all = system_names.iter().any(|n| n == "All");
+        let wanted = |key: &str| all || system_names.iter().any(|n| n == key);
+        let mut system = BTreeMap::new();
+        for (name, value) in [
+            ("SentTimestamp", message.created),
+            ("ApproximateReceiveCount", i64::from(message.receive_count)),
             (
                 "ApproximateFirstReceiveTimestamp",
-                message.first_receive.unwrap_or(0).to_string(),
+                message.first_receive.unwrap_or(0),
             ),
-            ("SenderId", self.config.account_id.clone()),
-        ]);
+        ] {
+            if wanted(name) {
+                system.insert(name, value.to_string());
+            }
+        }
+        if wanted("SenderId") {
+            system.insert("SenderId", self.config.account_id.clone());
+        }
         for (name, value) in [
             ("MessageGroupId", &message.group_id),
             ("MessageDeduplicationId", &message.deduplication_id),
             ("SequenceNumber", &message.sequence_number),
             ("AWSTraceHeader", &message.tracing_id),
         ] {
-            if let Some(value) = value {
+            if let Some(value) = value.as_ref().filter(|_| wanted(name)) {
                 system.insert(name, value.clone());
             }
         }
-        if let Some(source) = &message.dead_letter_source_queue {
+        if let Some(source) = &message.dead_letter_source_queue
+            && wanted("DeadLetterQueueSourceArn")
+        {
             system.insert("DeadLetterQueueSourceArn", self.config.arn(source));
-        }
-        if !system_names.iter().any(|n| n == "All") {
-            system.retain(|key, _| system_names.iter().any(|n| n == key));
         }
         let attributes: Attributes = message
             .attributes
@@ -1139,13 +1161,17 @@ fn label_value(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-async fn handle(
-    State(mut service): State<SqsService>,
-    method: Method,
-    OriginalUri(uri): OriginalUri,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
+async fn handle(State(mut service): State<SqsService>, request: Request) -> Response {
+    // Take the request apart instead of using header and URI extractors, which
+    // clone them. The body extractor still applies the configured size limit.
+    let (mut parts, body) = request.into_parts();
+    let headers = std::mem::take(&mut parts.headers);
+    let method = parts.method.clone();
+    let uri = parts
+        .extensions
+        .get::<OriginalUri>()
+        .map_or_else(|| parts.uri.clone(), |original| original.0.clone());
+    let body = Bytes::from_request(Request::from_parts(parts, body), &()).await;
     if method == Method::OPTIONS {
         return cors((StatusCode::NO_CONTENT, "").into_response());
     }
@@ -1176,7 +1202,7 @@ async fn handle(
         let path = uri.path().trim_end_matches('/');
         let suffix = format!("/{postfix}");
         let path = path.strip_suffix(&suffix).unwrap_or(path);
-        service.config.base_url = format!("{protocol}://{authority}{path}");
+        Arc::make_mut(&mut service.config).base_url = format!("{protocol}://{authority}{path}");
     }
     let parsed = if let Some(error) = rejected {
         Err(error)
@@ -1211,7 +1237,10 @@ async fn handle(
             .map_err(|_| ApiError::invalid("Invalid query parameters"))
             .and_then(protocol::query_request)
     };
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut request_id = [0u8; uuid::fmt::Hyphenated::LENGTH];
+    let request_id: &str = uuid::Uuid::new_v4()
+        .hyphenated()
+        .encode_lower(&mut request_id);
     let action = parsed
         .as_ref()
         .map(|(action, _)| action.clone())
@@ -1234,9 +1263,9 @@ async fn handle(
         Ok(value) => (
             StatusCode::OK,
             if json_protocol {
-                value.to_string()
+                json_text(&value)
             } else {
-                protocol::xml_response(&action, &value, &request_id)
+                protocol::xml_response(&action, &value, request_id)
             },
         ),
         Err(error) => (
@@ -1250,7 +1279,7 @@ async fn handle(
             if json_protocol {
                 json!({"__type":error.json_type(),"Message":error.message}).to_string()
             } else {
-                protocol::xml_error(&error, &request_id)
+                protocol::xml_error(&error, request_id)
             },
         ),
     };
@@ -1262,31 +1291,34 @@ async fn handle(
         );
     }
     response.headers_mut().insert(
-        "content-type",
-        (if json_protocol {
+        CONTENT_TYPE,
+        HeaderValue::from_static(if json_protocol {
             "application/x-amz-json-1.0"
         } else {
             "text/xml; charset=utf-8"
-        })
-        .parse()
-        .unwrap(),
+        }),
     );
-    response
-        .headers_mut()
-        .insert("x-amzn-requestid", request_id.parse().unwrap());
+    response.headers_mut().insert(
+        "x-amzn-requestid",
+        HeaderValue::from_str(request_id).expect("UUID header value"),
+    );
     cors(response)
 }
 
+/// Serialize a JSON response into one buffer sized for typical responses.
+fn json_text(value: &Value) -> String {
+    let mut buffer = Vec::with_capacity(1024);
+    serde_json::to_writer(&mut buffer, value).expect("JSON values serialize");
+    String::from_utf8(buffer).expect("serde_json writes UTF-8")
+}
+
 fn cors(mut response: Response) -> Response {
-    response
-        .headers_mut()
-        .insert("access-control-allow-origin", "*".parse().unwrap());
-    response
-        .headers_mut()
-        .insert("access-control-allow-headers", "*".parse().unwrap());
-    response.headers_mut().insert(
-        "access-control-allow-methods",
-        "GET, POST, OPTIONS".parse().unwrap(),
+    let headers = response.headers_mut();
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
     );
     response
 }
@@ -1297,6 +1329,184 @@ pub fn now() -> Timestamp {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+/// Validate a batch request's entries; these checks do not depend on the queue.
+fn batch_entries<'a>(p: &'a Value, action: &str, relaxed: bool) -> ApiResult<&'a Vec<Value>> {
+    let entries = p
+        .get("Entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::new("MissingParameter", "Entries is required"))?;
+    if entries.is_empty() {
+        return Err(ApiError::new(
+            "EmptyBatchRequest",
+            "Batch must contain entries",
+        ));
+    }
+    if !relaxed && entries.len() > 10 {
+        return Err(ApiError::new(
+            "TooManyEntriesInBatchRequest",
+            "Batch cannot exceed 10 entries",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let id = required(entry, "Id")?;
+        if id.is_empty()
+            || id.len() > 80
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        {
+            return Err(ApiError::new(
+                "InvalidBatchEntryId",
+                "Invalid batch entry ID",
+            ));
+        }
+        if !ids.insert(id) {
+            return Err(ApiError::new(
+                "BatchEntryIdsNotDistinct",
+                "Batch entry IDs must be distinct",
+            ));
+        }
+    }
+    if action == "SendMessageBatch" && !relaxed {
+        let mut length = 0usize;
+        for entry in entries {
+            length = length.saturating_add(required(entry, "MessageBody")?.encode_utf16().count());
+        }
+        if length > 1024 * 1024 {
+            return Err(ApiError::new(
+                "InvalidAttributeValue",
+                "Batch message bodies exceed the maximum length",
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+/// A SendMessage request parsed and validated without the engine lock. Each
+/// group of checks keeps its result, so that under the lock errors surface in
+/// the same order as when everything ran there: queue-dependent FIFO checks
+/// sit between the identifier and delay checks.
+struct PreparedSend {
+    content: ApiResult<(MessageBody, Attributes)>,
+    ids: ApiResult<(Option<String>, Option<String>)>,
+    delay: ApiResult<Option<u64>>,
+    tracing: ApiResult<Option<String>>,
+    body_digest: String,
+    attribute_digest: Option<String>,
+}
+
+fn prepare_send(p: &Value, tracing: Option<String>, relaxed: bool) -> PreparedSend {
+    let content = (|| {
+        let body = required(p, "MessageBody")?;
+        validate_text(body, relaxed)?;
+        let attributes = parse_message_attributes(p.get("MessageAttributes"), relaxed)?;
+        if !relaxed && attributes.len() > 10 {
+            return Err(ApiError::new(
+                "InvalidAttributeValue",
+                "At most 10 message attributes are allowed",
+            ));
+        }
+        Ok((MessageBody::from(body), attributes))
+    })();
+    let ids = (|| {
+        let group_id = optional(p, "MessageGroupId")?.map(str::to_owned);
+        let deduplication_id = optional(p, "MessageDeduplicationId")?.map(str::to_owned);
+        for (parameter, id) in [
+            ("MessageGroupId", &group_id),
+            ("MessageDeduplicationId", &deduplication_id),
+        ] {
+            let Some(id) = id else {
+                continue;
+            };
+            if id.is_empty() || id.len() > 128 || !id.bytes().all(|c| c.is_ascii_graphic()) {
+                return Err(ApiError::invalid(format!(
+                    "{parameter} can only include alphanumeric and punctuation characters. 1 to 128 in length."
+                )));
+            }
+        }
+        Ok((group_id, deduplication_id))
+    })();
+    let delay = if p.get("DelaySeconds").is_some() {
+        integer(p, "DelaySeconds", None, 900).map(Some)
+    } else {
+        Ok(None)
+    };
+    let tracing =
+        parse_message_attributes(p.get("MessageSystemAttributes"), relaxed).and_then(|system| {
+            match system.get("AWSTraceHeader") {
+                Some(MessageAttribute {
+                    value: AttributeValue::String(value),
+                    ..
+                }) => Ok(Some(value.clone())),
+                Some(_) => Err(ApiError::invalid("AWSTraceHeader must be a String")),
+                None => Ok(tracing),
+            }
+        });
+    let (body_digest, attribute_digest) = match &content {
+        Ok((body, attributes)) => (
+            digest::body_digest(body),
+            (!attributes.is_empty()).then(|| digest::attribute_digest(attributes)),
+        ),
+        Err(_) => (String::new(), None),
+    };
+    PreparedSend {
+        content,
+        ids,
+        delay,
+        tracing,
+        body_digest,
+        attribute_digest,
+    }
+}
+
+/// A stored (or deduplicated) message, for the response built after the lock.
+struct Sent {
+    id: String,
+    sequence_number: Option<String>,
+    body_digest: String,
+    attribute_digest: Option<String>,
+}
+
+impl Sent {
+    fn into_json(self) -> Value {
+        let mut result = json!({"MessageId":self.id, "MD5OfMessageBody":self.body_digest});
+        if let Some(digest) = self.attribute_digest {
+            result["MD5OfMessageAttributes"] = json!(digest);
+        }
+        if let Some(sequence) = self.sequence_number {
+            result["SequenceNumber"] = json!(sequence);
+        }
+        result
+    }
+}
+
+struct PreparedBatch {
+    name: ApiResult<String>,
+    /// Entry IDs with their prepared sends, or the batch-level validation error.
+    entries: ApiResult<Vec<(Value, PreparedSend)>>,
+}
+
+struct SentBatch(Vec<(Value, ApiResult<Sent>)>);
+
+impl SentBatch {
+    fn into_json(self) -> Value {
+        let mut successful = Vec::new();
+        let mut failed = Vec::new();
+        for (id, result) in self.0 {
+            match result {
+                Ok(sent) => {
+                    let mut result = sent.into_json();
+                    result["Id"] = id;
+                    successful.push(result);
+                }
+                Err(error) => failed.push(json!({"Id":id, "Code":error.code, "Message":error.message, "SenderFault":true})),
+            }
+        }
+        json!({"Successful":successful, "Failed":failed})
+    }
 }
 
 fn required<'a>(p: &'a Value, key: &str) -> ApiResult<&'a str> {
@@ -1362,18 +1572,18 @@ fn queue_name(p: &Value, context: &str) -> ApiResult<String> {
     let path = url
         .parse::<Uri>()
         .map_err(|_| ApiError::invalid("Invalid QueueUrl"))?;
-    let prefix = format!("{}/", context.trim_end_matches('/'));
     let path = path
         .path()
-        .strip_prefix(&prefix)
+        .strip_prefix(context.trim_end_matches('/'))
+        .and_then(|path| path.strip_prefix('/'))
         .ok_or_else(|| ApiError::invalid("QueueUrl must include the configured context path"))?;
-    let parts: Vec<_> = path.trim_end_matches('/').split('/').collect();
-    let name = match parts.as_slice() {
-        [name] => *name,
-        [account, name]
+    let mut parts = path.trim_end_matches('/').split('/');
+    let name = match (parts.next(), parts.next(), parts.next()) {
+        (Some(name), None, _) => name,
+        (Some(account), Some(name), None)
             if !account.is_empty() && account.bytes().all(|c| c.is_ascii_alphanumeric()) =>
         {
-            *name
+            name
         }
         _ => {
             return Err(ApiError::invalid(

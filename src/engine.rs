@@ -149,6 +149,23 @@ impl Queue {
         Some(message)
     }
 
+    /// Move a message whose visibility changed. FIFO index keys do not depend
+    /// on `next_delivery`, so only standard queues need an index update.
+    fn reschedule(&mut self, previous_delivery: Timestamp, message: &Message) {
+        if self.config.fifo || previous_delivery == message.next_delivery {
+            return;
+        }
+        if let Some(index) = &mut self.delivery {
+            let id = index
+                .standard
+                .take(&(previous_delivery, message.order, message.id.clone()))
+                .map_or_else(|| message.id.clone(), |(_, _, id)| id);
+            index
+                .standard
+                .insert((message.next_delivery, message.order, id));
+        }
+    }
+
     fn reindex(&mut self, previous: &Message, updated: &Message) {
         if let Some(index) = &mut self.delivery {
             index.remove(previous, self.config.fifo);
@@ -383,7 +400,10 @@ impl QueueManager {
     ) -> Result<Message, Error> {
         // Validate the entire routing graph before committing copies, preventing
         // a misconfigured cycle from causing recursion or partially writing.
-        self.validate_routing(name, &mut BTreeSet::new())?;
+        let queue = self.get(name)?;
+        if queue.copy_to.is_some() || queue.move_to.is_some() {
+            self.validate_routing(name, &mut BTreeSet::new())?;
+        }
         self.send_routed(name, request, now)
     }
 
@@ -407,10 +427,15 @@ impl QueueManager {
         mut request: SendMessage,
         now: Timestamp,
     ) -> Result<Message, Error> {
-        let config = self.queue(name)?.clone();
-        let copy_to = self.get(name)?.copy_to.clone();
-        let move_to = self.get(name)?.move_to.clone();
-        self.prepare_fifo(&config, &mut request)?;
+        let queue = self.get(name)?;
+        let (fifo, content_based_deduplication, delay_ms) = (
+            queue.config.fifo,
+            queue.config.content_based_deduplication,
+            queue.config.delay_ms,
+        );
+        let copy_to = queue.copy_to.clone();
+        let move_to = queue.move_to.clone();
+        self.prepare_fifo(fifo, content_based_deduplication, &mut request)?;
         if let Some(next) = copy_to
             && self.is_live(&next)
         {
@@ -429,7 +454,7 @@ impl QueueManager {
         queue
             .deduplication
             .retain(|_, entry| after(entry.message.created, 300_000) >= now);
-        if config.fifo
+        if fifo
             && let Some(previous) = request
                 .deduplication_id
                 .as_ref()
@@ -447,7 +472,7 @@ impl QueueManager {
             attributes: request.attributes,
             next_delivery: request
                 .delivery_at
-                .unwrap_or_else(|| after(now, request.delay_ms.unwrap_or(config.delay_ms))),
+                .unwrap_or_else(|| after(now, request.delay_ms.unwrap_or(delay_ms))),
             created: now,
             first_receive: None,
             receive_count: 0,
@@ -469,16 +494,17 @@ impl QueueManager {
 
     fn prepare_fifo(
         &mut self,
-        config: &QueueConfig,
+        fifo: bool,
+        content_based_deduplication: bool,
         request: &mut SendMessage,
     ) -> Result<(), Error> {
-        if config.fifo {
+        if fifo {
             if request.group_id.as_ref().is_none_or(String::is_empty) {
                 return Err(Error::InvalidParameter(
                     "MessageGroupId is required for FIFO queues".into(),
                 ));
             }
-            if request.deduplication_id.is_none() && config.content_based_deduplication {
+            if request.deduplication_id.is_none() && content_based_deduplication {
                 request.deduplication_id =
                     Some(format!("{:x}", Sha256::digest(request.body.as_bytes())));
             }
@@ -555,28 +581,29 @@ impl QueueManager {
             (queue.selected(request.count, now), false)
         };
 
-        let config = queue.config.clone();
+        let max_receive_count = queue
+            .config
+            .dead_letter_queue
+            .as_ref()
+            .map(|dlq| dlq.max_receive_count);
+        let default_visibility_ms = queue.config.visibility_timeout_ms;
         let dead_letters = queue.dead_letters.clone();
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(ids.len());
         for id in ids {
-            let message = self
+            let receive_count = self
                 .get(name)?
                 .messages
                 .get(&id)
                 .expect("selection invariant")
-                .clone();
-            if !from_cache
-                && config
-                    .dead_letter_queue
-                    .as_ref()
-                    .is_some_and(|dlq| message.receive_count >= dlq.max_receive_count)
-            {
+                .receive_count;
+            if !from_cache && max_receive_count.is_some_and(|max| receive_count >= max) {
                 if let Some(target) = &dead_letters
                     && self.is_live(target)
                 {
+                    let message = self.get(name)?.messages[&id].clone();
                     // Upstream DLQ delivery is asynchronous: rejection must not
                     // abort a receive batch or strand the poison message.
-                    if let Err(error) = self.move_to_dlq(&target.name, name, message.clone(), now) {
+                    if let Err(error) = self.move_to_dlq(&target.name, name, message, now) {
                         eprintln!("Dead-letter delivery {name} -> {}: {error}", target.name);
                     }
                 }
@@ -589,18 +616,18 @@ impl QueueManager {
             }
             let queue = self.get_mut(name)?;
             let message = queue.messages.get_mut(&id).expect("selection invariant");
-            let previous = message.clone();
+            let previous_delivery = message.next_delivery;
             message.receipt_handle = Some(format!("{}#{}", message.id, Uuid::new_v4()));
             message.next_delivery = after(
                 now,
                 request
                     .visibility_timeout_ms
-                    .unwrap_or(config.visibility_timeout_ms),
+                    .unwrap_or(default_visibility_ms),
             );
             message.receive_count = message.receive_count.saturating_add(1);
             message.first_receive.get_or_insert(now);
             let message = message.clone();
-            queue.reindex(&previous, &message);
+            queue.reschedule(previous_delivery, &message);
             queue.refresh_history(&message);
             self.events.push(QueueEvent::MessageUpdated {
                 queue: name.into(),
@@ -707,10 +734,10 @@ impl QueueManager {
             .get_mut(id)
             .filter(|m| m.receipt_handle.as_deref() == Some(receipt))
             .ok_or_else(|| Error::InvalidReceiptHandle(receipt.into()))?;
-        let previous = message.clone();
+        let previous_delivery = message.next_delivery;
         message.next_delivery = after(now, timeout_ms);
         let message = message.clone();
-        queue.reindex(&previous, &message);
+        queue.reschedule(previous_delivery, &message);
         queue.refresh_history(&message);
         self.events.push(QueueEvent::MessageUpdated {
             queue: name.into(),

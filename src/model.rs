@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt, ops::Deref, sync::Arc};
 
 pub type Timestamp = i64;
 pub type Attributes = BTreeMap<String, MessageAttribute>;
@@ -113,10 +113,83 @@ impl CreateQueue {
     }
 }
 
+/// An immutable message body, shared rather than copied between the queue,
+/// persistence events and results. It derefs to `str`.
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageBody(Arc<str>);
+
+impl MessageBody {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for MessageBody {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for MessageBody {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MessageBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0, formatter)
+    }
+}
+
+impl fmt::Display for MessageBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&*self.0, formatter)
+    }
+}
+
+impl From<&str> for MessageBody {
+    fn from(body: &str) -> Self {
+        Self(body.into())
+    }
+}
+
+impl From<String> for MessageBody {
+    fn from(body: String) -> Self {
+        Self(body.into())
+    }
+}
+
+impl From<MessageBody> for String {
+    fn from(body: MessageBody) -> Self {
+        body.0.to_string()
+    }
+}
+
+impl PartialEq<str> for MessageBody {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for MessageBody {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for MessageBody {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SendMessage {
     pub id: Option<String>,
-    pub body: String,
+    pub body: MessageBody,
     pub attributes: Attributes,
     pub delay_ms: Option<u64>,
     /// Absolute delivery time for embedded sends and persistence replay.
@@ -129,7 +202,7 @@ pub struct SendMessage {
 }
 
 impl SendMessage {
-    pub fn body(body: impl Into<String>) -> Self {
+    pub fn body(body: impl Into<MessageBody>) -> Self {
         Self {
             body: body.into(),
             ..Self::default()
@@ -141,7 +214,7 @@ impl SendMessage {
 pub struct Message {
     pub id: String,
     pub receipt_handle: Option<String>,
-    pub body: String,
+    pub body: MessageBody,
     pub attributes: Attributes,
     pub next_delivery: Timestamp,
     pub created: Timestamp,
