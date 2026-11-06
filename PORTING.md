@@ -108,6 +108,24 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
+## 0.4.0 Docker publication
+
+The images from release commit `f6bf623` are published to
+`localhost:5555/igorski89/rusticmq:latest`, `:0.4.0` and `:f6bf623`. All three
+tags point to the same AMD64/ARM64 manifest index:
+
+```text
+sha256:2cbe5068f60e60cb1653b81a674723b562901782f034df3ea62aa71971834c23
+```
+
+The full Docker audit passed 252 tests on ARM64 locally: 74 Rust, 150 original
+Java SDK, five original Node.js SDK, 14 boto3, three Query/XML, five
+process/container lifecycle scenarios and one named-volume test, plus the
+concurrent load check. CI run 42294099525 passed the same audit on native AMD64
+and ARM64 runners. CI had failed since 0.2.0 on a stale Rust test count, which
+hid two Linux-only test-harness cleanup failures, fixed in `d53c93e` and `2a5174c`;
+neither changes the image. Both published architectures passed a smoke test.
+
 ## 0.3.0 Docker publication
 
 The images from release commit `81751e3` are published to

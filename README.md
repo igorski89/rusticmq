@@ -130,8 +130,8 @@ The container runs as UID 10001; bind-mounted data directories must be writable
 by that user. Configure `RUSTICMQ_BASE_URL` to the address used by your clients.
 The multi-architecture image is available in the local registry as
 `localhost:5555/igorski89/rusticmq:0.4.0` (also `:latest`) for Linux AMD64 and
-ARM64. The complete backend test audit in [PORTING.md](PORTING.md) was run on
-0.1.0.
+ARM64. The complete backend test audit in [PORTING.md](PORTING.md) passed on
+0.4.0.
 To verify volume persistence across container replacements:
 
 ```sh
