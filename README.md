@@ -203,8 +203,5 @@ let messages = queues.receive_messages("example", ReceiveMessages::count(1), 0)?
 
 Engine timestamps are epoch milliseconds. Embedding callers serialize manager
 access and supply time. Mutation events can be drained for persistence listeners.
-The library sets no global allocator. The default `jemalloc` feature only builds
-jemalloc for the `rusticmq` executable, so embedding applications can use
-`default-features = false`.
 
 Licensed under Apache 2.0; upstream attribution is preserved in `NOTICE.txt`.

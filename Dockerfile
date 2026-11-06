@@ -1,5 +1,5 @@
 FROM rust:alpine AS build
-RUN apk add --no-cache musl-dev ca-certificates binutils make
+RUN apk add --no-cache musl-dev ca-certificates binutils
 WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY vendor ./vendor
@@ -10,8 +10,7 @@ ARG RUSTICMQ_COMMIT=unknown
 RUN cargo build --locked --profile container \
     && ! readelf --program-headers target/container/rusticmq | grep -q INTERP \
     && ! readelf --dynamic target/container/rusticmq | grep -q NEEDED \
-    && mkdir -p /runtime/data /runtime/tmp /runtime/jemalloc \
-    && cp "$(find "$CARGO_HOME/registry/src" -path '*/tikv-jemalloc-sys-*/jemalloc/COPYING' | head -n 1)" /runtime/jemalloc/COPYING \
+    && mkdir -p /runtime/data /runtime/tmp \
     && chmod 1777 /runtime/tmp
 
 FROM build AS test
@@ -25,7 +24,6 @@ COPY --from=build --chown=10001:10001 /runtime/data /data
 COPY --from=build /runtime/tmp /tmp
 COPY --from=build /build/LICENSE.txt /build/NOTICE.txt /usr/share/doc/rusticmq/
 COPY --from=build /build/vendor/hocon/LICENSE /usr/share/doc/rusticmq/hocon/LICENSE
-COPY --from=build /runtime/jemalloc/COPYING /usr/share/doc/rusticmq/jemalloc/COPYING
 USER 10001:10001
 WORKDIR /data
 EXPOSE 9324
