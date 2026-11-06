@@ -189,6 +189,27 @@ This also requires Node.js/npm and a free port 9321. The runner prepares an
 isolated copy of the pinned upstream source, starts its own server, runs the
 suites and stops the server. CI runs these suites as well.
 
+## Performance
+
+Compared with ElasticMQ 1.7.1 as `linux/arm64` containers under the same limits,
+RusticMQ 0.4.0 ties ElasticMQ native on durable concurrent sends, receives twice as
+fast as native and as fast as the JVM build, and is the only one that lost no
+acknowledged message when killed.
+The ElasticMQ JVM build is about twice as fast at concurrent sends. These are medians
+on one laptop's Docker VM:
+
+| | RusticMQ | ElasticMQ native | ElasticMQ JVM |
+| --- | --- | --- | --- |
+| Send, 64 connections, durable (msg/s) | 16,277 | 17,199 | 31,901 |
+| Receive and delete, 64 connections, durable (msg/s) | 20,221 | 10,041 | 18,416 |
+| Send, 64 connections, in memory (msg/s) | 21,675 | 29,966 | 53,753 |
+| Send, 1 connection, in memory (msg/s) | 5,122 | 2,907 | 3,610 |
+| Startup (ms) | 58 | 121 | 1,217 |
+| Idle process memory (MiB) | 0.3 | 14.8 | 151 |
+| Acknowledged sends lost after `SIGKILL`, three rounds | 0, 0, 0 | 1,942, 2,814, 3,995 | 2,662, 2,262, 3,143 |
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the method, all results and their limits.
+
 ## Embed
 
 ```rust
