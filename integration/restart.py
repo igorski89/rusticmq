@@ -96,6 +96,11 @@ class RestartTests(unittest.TestCase):
 
     def test_sqlite_file_restores_messages_and_valid_receipts(self):
         args = ["--data-dir", self.root / "data"]
+        if self.image:
+            # Created here rather than by the container's UID, so that the
+            # test's own user can remove the SQLite files on Linux hosts.
+            (self.root / "data").mkdir(mode=0o777)
+            (self.root / "data").chmod(0o777)
         self.start(args)
         url = self.client.create_queue(QueueName="durable", tags={"team": "rust"})["QueueUrl"]
         sent = self.client.send_message(QueueUrl=url, MessageBody="persisted")
