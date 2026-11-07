@@ -108,6 +108,20 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
+## 0.4.1 Docker publication
+
+The images from release commit `cbf9302` are published to
+`localhost:5555/igorski89/rusticmq:latest`, `:0.4.1` and `:cbf9302`. All three
+tags point to the same AMD64/ARM64 manifest index:
+
+```text
+sha256:60f80075bdb5bd0d46fcec3e36c68e240c8ecdc57686b4f1c61b822babda3e52
+```
+
+0.4.1 generates time-ordered (UUIDv7) message IDs. The full Docker audit passed
+253 tests on ARM64 locally, with 75 Rust tests, and CI run 42420229289 passed it
+on native AMD64 and ARM64 runners. Both published architectures passed a smoke test.
+
 ## 0.4.0 Docker publication
 
 The images from release commit `f6bf623` are published to
