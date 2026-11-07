@@ -29,8 +29,17 @@ cargo run -- --config ./elasticmq.conf --data-dir ./data
 RusticMQ creates the directory if needed and keeps `rusticmq.sqlite` in it, with
 the `-wal` and `-shm` files SQLite writes beside it. Mount or back up the whole
 directory, never the database file alone. `--data-dir :memory:` (also `:memory`)
-selects ephemeral storage. H2 database
-compatibility is excluded. HOCON (Human-Optimized Config Object Notation) is the
+selects ephemeral storage.
+
+Data directories from earlier versions open in 0.5.0 unchanged. Since 0.5.0,
+receives and visibility changes are stored in a separate table that 0.4.x and
+older ignore. Running an older version on the same directory makes messages
+that were in flight visible again and restarts their receive counts. Upgrading
+again afterwards can keep messages that the older version received hidden until
+an earlier visibility timeout expires, and their receipt handles stop working.
+No message is lost either way.
+
+H2 database compatibility is excluded. HOCON (Human-Optimized Config Object Notation) is the
 configuration format used by ElasticMQ: it supports readable objects, comments,
 includes and duration values. Existing ElasticMQ HOCON files configure startup
 queues, durations, routing, tags, server addresses and context paths. For example:
@@ -129,9 +138,9 @@ includes CA certificates and license notices, with no shell or shared libraries.
 The container runs as UID 10001; bind-mounted data directories must be writable
 by that user. Configure `RUSTICMQ_BASE_URL` to the address used by your clients.
 The multi-architecture image is available in the local registry as
-`localhost:5555/igorski89/rusticmq:0.4.1` (also `:latest`) for Linux AMD64 and
+`localhost:5555/igorski89/rusticmq:0.5.0` (also `:latest`) for Linux AMD64 and
 ARM64. The complete backend test audit in [PORTING.md](PORTING.md) passed on
-0.4.1.
+0.5.0.
 To verify volume persistence across container replacements:
 
 ```sh
