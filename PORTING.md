@@ -108,6 +108,23 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
+## 0.5.0 Docker publication
+
+The images from release commit `60dd354` are published to
+`localhost:5555/igorski89/rusticmq:latest`, `:0.5.0` and `:60dd354`. All three
+tags point to the same AMD64/ARM64 manifest index:
+
+```text
+sha256:432740d52e57b001e5cbbcc04be0c00655d758ea59b161a2f5ee180aba523b73
+```
+
+0.5.0 stores receive state in a separate `message_state` table and takes the
+engine lock once per receive. The full Docker audit passed 255 tests on ARM64
+locally, with 77 Rust tests, and CI run 42425772318 passed it on native AMD64
+and ARM64 runners. A 0.4.1 data volume was upgraded in place with in-flight
+messages, receive counts and receipt handles intact; the rollback caveat is in
+the README. Both published architectures passed a smoke test.
+
 ## 0.4.1 Docker publication
 
 The images from release commit `cbf9302` are published to
