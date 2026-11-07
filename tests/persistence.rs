@@ -388,3 +388,113 @@ fn sqlite_prune_removes_queues_and_their_messages() {
             .is_empty()
     );
 }
+
+#[test]
+fn receives_store_state_without_rewriting_the_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let store = Persistence::open(None, Some(path.clone()), false).unwrap();
+    let mut manager = store.restore(Vec::new(), 0).unwrap();
+    manager.create_queue(CreateQueue::named("q"), 0).unwrap();
+    let sent = manager
+        .send_message("q", SendMessage::body("x".repeat(100_000)), 0)
+        .unwrap();
+    flush(&store, &mut manager);
+    let database = rusqlite::Connection::open(&path).unwrap();
+    let stored = |database: &rusqlite::Connection| -> (String, i64) {
+        database
+            .query_row(
+                "SELECT data, (SELECT count(*) FROM message_state) FROM messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let (as_sent, states) = stored(&database);
+    assert_eq!(states, 0);
+
+    let received = manager
+        .receive_messages("q", ReceiveMessages::count(1), 100)
+        .unwrap()
+        .remove(0);
+    let receipt = received.receipt_handle.clone().unwrap();
+    manager
+        .change_visibility("q", &receipt, 5_000, 200)
+        .unwrap();
+    flush(&store, &mut manager);
+    assert_eq!(stored(&database), (as_sent, 1));
+    let (count, next_delivery, first_receive, handle): (u32, i64, i64, String) = database
+        .query_row(
+            "SELECT receive_count, next_delivery, first_receive, receipt_handle FROM message_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!((count, next_delivery, first_receive), (1, 5_200, 100));
+    assert_eq!(handle, receipt);
+
+    let restored = store.restore(Vec::new(), 300).unwrap();
+    let message = restored.messages("q").unwrap().remove(0);
+    assert_eq!(message.id, sent.id);
+    assert_eq!(message.receive_count, 1);
+    assert_eq!(message.next_delivery, 5_200);
+    assert_eq!(message.receipt_handle.as_deref(), Some(receipt.as_str()));
+
+    manager.delete_message("q", &receipt).unwrap();
+    flush(&store, &mut manager);
+    let left: (i64, i64) = database
+        .query_row(
+            "SELECT (SELECT count(*) FROM messages), (SELECT count(*) FROM message_state)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(left, (0, 0));
+}
+
+#[test]
+fn databases_without_message_state_are_upgraded_in_place() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let received = {
+        let store = Persistence::open(None, Some(path.clone()), false).unwrap();
+        let mut manager = store.restore(Vec::new(), 0).unwrap();
+        manager.create_queue(CreateQueue::named("q"), 0).unwrap();
+        manager
+            .send_message("q", SendMessage::body("old"), 0)
+            .unwrap();
+        flush(&store, &mut manager);
+        // Older versions rewrote the message row on receive and had no state table.
+        let received = manager
+            .receive_messages("q", ReceiveMessages::count(1), 100)
+            .unwrap()
+            .remove(0);
+        let database = rusqlite::Connection::open(&path).unwrap();
+        database
+            .execute(
+                "UPDATE messages SET data=?1",
+                [serde_json::to_string(&received).unwrap()],
+            )
+            .unwrap();
+        database
+            .execute_batch("DROP TABLE message_state; PRAGMA user_version=0;")
+            .unwrap();
+        received
+    };
+    let store = Persistence::open(None, Some(path.clone()), false).unwrap();
+    let mut manager = store.restore(Vec::new(), 200).unwrap();
+    assert_eq!(manager.messages("q").unwrap(), vec![received.clone()]);
+    let version: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+    let again = manager
+        .receive_messages("q", ReceiveMessages::count(1), 40_000)
+        .unwrap()
+        .remove(0);
+    flush(&store, &mut manager);
+    let restored = store.restore(Vec::new(), 40_000).unwrap();
+    assert_eq!(restored.messages("q").unwrap(), vec![again.clone()]);
+    assert_eq!(again.receive_count, 2);
+}

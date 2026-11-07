@@ -1,5 +1,5 @@
 //! Queue definition files and transactional SQLite message storage.
-use crate::{QueueConfig, QueueEvent, QueueManager, config};
+use crate::{Message, QueueConfig, QueueEvent, QueueManager, config};
 use rusqlite::{Connection, params};
 use std::{
     collections::BTreeMap,
@@ -49,10 +49,19 @@ impl Persistence {
     ) -> Result<Self, PersistenceError> {
         let connection = database_path.map(|path| -> Result<_, PersistenceError> {
             let connection = Connection::open(if path == Path::new(":memory") { PathBuf::from(":memory:") } else { path })?;
+            // `messages` holds each message as sent. `message_state` holds the fields
+            // that receives and visibility changes update, so those never rewrite
+            // the body. Version 0 databases have no `message_state` and need nothing
+            // else; the table is created empty for them.
             connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
                 CREATE TABLE IF NOT EXISTS queues (name TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS messages (queue TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
-                    id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(queue,id));")?;
+                    id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(queue,id));
+                CREATE TABLE IF NOT EXISTS message_state (queue TEXT NOT NULL, id TEXT NOT NULL,
+                    next_delivery INTEGER NOT NULL, receive_count INTEGER NOT NULL,
+                    first_receive INTEGER, receipt_handle TEXT, PRIMARY KEY(queue,id),
+                    FOREIGN KEY(queue,id) REFERENCES messages(queue,id) ON DELETE CASCADE);
+                PRAGMA user_version=1;")?;
             if prune { connection.execute("DELETE FROM queues", [])?; }
             Ok(Mutex::new(connection))
         }).transpose()?;
@@ -107,14 +116,33 @@ impl Persistence {
             let connection = connection
                 .lock()
                 .map_err(|_| PersistenceError::Config("Database mutex poisoned".into()))?;
-            let mut query =
-                connection.prepare("SELECT queue,data FROM messages ORDER BY queue,id")?;
+            let mut query = connection.prepare(
+                "SELECT m.queue, m.data, s.next_delivery, s.receive_count, s.first_receive, s.receipt_handle
+                 FROM messages m LEFT JOIN message_state s ON s.queue = m.queue AND s.id = m.id
+                 ORDER BY m.queue, m.id",
+            )?;
             let rows = query.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                let state = match row.get::<_, Option<i64>>(2)? {
+                    Some(next_delivery) => Some(MessageState {
+                        next_delivery,
+                        receive_count: row.get(3)?,
+                        first_receive: row.get(4)?,
+                        receipt_handle: row.get(5)?,
+                    }),
+                    None => None,
+                };
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, state))
             })?;
             for row in rows {
-                let (queue, data) = row?;
-                manager.restore_messages(&queue, vec![serde_json::from_str(&data)?])?;
+                let (queue, data, state) = row?;
+                let mut message: Message = serde_json::from_str(&data)?;
+                if let Some(state) = state {
+                    message.next_delivery = state.next_delivery;
+                    message.receive_count = state.receive_count;
+                    message.first_receive = state.first_receive;
+                    message.receipt_handle = state.receipt_handle;
+                }
+                manager.restore_messages(&queue, vec![message])?;
             }
         }
         Ok(manager)
@@ -157,11 +185,30 @@ impl Persistence {
                             .prepare_cached("DELETE FROM queues WHERE name=?1")?
                             .execute([name])?;
                     }
-                    QueueEvent::MessageAdded { queue, message }
-                    | QueueEvent::MessageUpdated { queue, message } => {
+                    QueueEvent::MessageAdded { queue, message } => {
                         transaction
                             .prepare_cached("INSERT INTO messages(queue,id,data) VALUES(?1,?2,?3) ON CONFLICT(queue,id) DO UPDATE SET data=excluded.data")?
                             .execute(params![queue, message.id, serde_json::to_string(message)?])?;
+                        // A replaced message starts from the state stored with it.
+                        transaction
+                            .prepare_cached("DELETE FROM message_state WHERE queue=?1 AND id=?2")?
+                            .execute(params![queue, message.id])?;
+                    }
+                    // Receives and visibility changes only change these fields.
+                    QueueEvent::MessageUpdated { queue, message } => {
+                        transaction
+                            .prepare_cached("INSERT INTO message_state(queue,id,next_delivery,receive_count,first_receive,receipt_handle)
+                                VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(queue,id) DO UPDATE SET
+                                next_delivery=excluded.next_delivery, receive_count=excluded.receive_count,
+                                first_receive=excluded.first_receive, receipt_handle=excluded.receipt_handle")?
+                            .execute(params![
+                                queue,
+                                message.id,
+                                message.next_delivery,
+                                message.receive_count,
+                                message.first_receive,
+                                message.receipt_handle
+                            ])?;
                     }
                     QueueEvent::MessageRemoved { queue, id } => {
                         transaction
@@ -218,6 +265,14 @@ impl Persistence {
             &serde_json::json!({"queues":queues}),
         )?))
     }
+}
+
+/// The stored fields of a message that change after it is sent.
+struct MessageState {
+    next_delivery: i64,
+    receive_count: u32,
+    first_receive: Option<i64>,
+    receipt_handle: Option<String>,
 }
 
 /// Outcome of a group commit; the error text is the database's.
@@ -329,8 +384,8 @@ impl Group {
             .events
             .iter()
             .map(|event| match event {
-                QueueEvent::MessageAdded { message, .. }
-                | QueueEvent::MessageUpdated { message, .. } => message.body.len(),
+                // Updates store only the message's state, not its body.
+                QueueEvent::MessageAdded { message, .. } => message.body.len(),
                 _ => 0,
             })
             .sum::<usize>();
