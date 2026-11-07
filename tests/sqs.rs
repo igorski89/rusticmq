@@ -1264,13 +1264,30 @@ async fn responses_wait_for_their_commit_without_blocking_the_engine() {
     let duplicate = tokio::spawn(send(app.clone()));
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert!(!duplicate.is_finished(), "duplicate acknowledged early");
+    // A receive may already see the message, but must not deliver it before
+    // the send that created it is durable.
+    let receive = tokio::spawn({
+        let app = app.clone();
+        async move { call(&app, "ReceiveMessage", json!({"QueueUrl":url})).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !receive.is_finished(),
+        "delivered before the send was durable"
+    );
 
     blocker.execute_batch("ROLLBACK").unwrap();
     let original = original.await.unwrap();
     let duplicate = duplicate.await.unwrap();
+    let receive = receive.await.unwrap();
     assert_eq!(original.0, StatusCode::OK);
     assert_eq!(duplicate.0, StatusCode::OK);
     assert_eq!(original.1["MessageId"], duplicate.1["MessageId"]);
+    assert_eq!(receive.0, StatusCode::OK);
+    assert_eq!(
+        receive.1["Messages"][0]["MessageId"],
+        original.1["MessageId"]
+    );
     let stored: i64 = blocker
         .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
         .unwrap();

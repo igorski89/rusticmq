@@ -789,42 +789,65 @@ impl SqsService {
         } else {
             None
         };
-        let (wait_default, commit) = {
-            let mut manager = self.manager.lock().await;
-            self.ensure_queue(&mut manager, &name, now())?;
-            let commit = self.notify_change(&mut manager);
-            (manager.queue(&name)?.receive_wait_ms / 1000, commit)
-        };
-        commit.wait().await?;
-        let wait = integer(p, "WaitTimeSeconds", Some(wait_default), self.wait_limit())?;
-        let attempt_id = optional(p, "ReceiveRequestAttemptId")?.map(str::to_owned);
-        let request = ReceiveMessages {
-            count: count as usize,
-            visibility_timeout_ms: visibility,
-            attempt_id,
-        };
+        // Parsed before locking; errors are still reported in the original order,
+        // after the queue lookup.
+        let attempt_id = optional(p, "ReceiveRequestAttemptId").map(|id| id.map(str::to_owned));
         let system_names = if p.get("MessageSystemAttributeNames").is_some() {
-            strings(p, "MessageSystemAttributeNames")?
+            strings(p, "MessageSystemAttributeNames")
         } else {
-            strings(p, "AttributeNames")?
+            strings(p, "AttributeNames")
         };
-        let attribute_names = strings(p, "MessageAttributeNames")?;
-        let deadline = tokio::time::Instant::now()
-            .checked_add(Duration::from_secs(wait))
-            .ok_or_else(|| ApiError::invalid("WaitTimeSeconds is too large"))?;
+        let attribute_names = strings(p, "MessageAttributeNames");
         let mut changed = self.changed.subscribe();
         let mut stopping = self.stopping.subscribe();
+        // The queue lookup and the first receive share one lock and one commit.
+        // The writer commits in order, so that commit also covers any earlier
+        // change, such as the queue being created here.
+        let (setup, commit) = {
+            let mut manager = self.manager.lock().await;
+            let now = now();
+            let setup = (|| -> ApiResult<_> {
+                self.ensure_queue(&mut manager, &name, now)?;
+                let wait_default = manager.queue(&name)?.receive_wait_ms / 1000;
+                let wait = integer(p, "WaitTimeSeconds", Some(wait_default), self.wait_limit())?;
+                let request = ReceiveMessages {
+                    count: count as usize,
+                    visibility_timeout_ms: visibility,
+                    attempt_id: attempt_id?,
+                };
+                let names = (system_names?, attribute_names?);
+                let deadline = tokio::time::Instant::now()
+                    .checked_add(Duration::from_secs(wait))
+                    .ok_or_else(|| ApiError::invalid("WaitTimeSeconds is too large"))?;
+                let first = (!*stopping.borrow()).then(|| {
+                    (
+                        manager.receive_messages(&name, request.clone(), now),
+                        manager.next_delivery(&name),
+                    )
+                });
+                Ok((request, names, deadline, first))
+            })();
+            (setup, self.notify_change(&mut manager))
+        };
+        commit.wait().await?;
+        let (request, (system_names, attribute_names), deadline, mut first) = setup?;
         loop {
-            if *stopping.borrow() {
-                return Ok(json!({"Messages":[]}));
-            }
-            let (messages, next_delivery, commit) = {
-                let mut manager = self.manager.lock().await;
-                let messages = manager.receive_messages(&name, request.clone(), now());
-                let commit = self.notify_change(&mut manager);
-                (messages, manager.next_delivery(&name), commit)
+            let (messages, next_delivery) = match first.take() {
+                Some(result) => result,
+                None => {
+                    if *stopping.borrow() {
+                        return Ok(json!({"Messages":[]}));
+                    }
+                    let (messages, next_delivery, commit) = {
+                        let mut manager = self.manager.lock().await;
+                        let messages = manager.receive_messages(&name, request.clone(), now());
+                        let commit = self.notify_change(&mut manager);
+                        (messages, manager.next_delivery(&name), commit)
+                    };
+                    commit.wait().await?;
+                    (messages, next_delivery)
+                }
             };
-            commit.wait().await?;
             let (messages, next_delivery) = (messages?, next_delivery?);
             if !messages.is_empty() || tokio::time::Instant::now() >= deadline {
                 return Ok(
