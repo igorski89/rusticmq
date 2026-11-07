@@ -466,7 +466,10 @@ impl QueueManager {
             return Ok(previous);
         }
         let message = Message {
-            id: request.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            // Time-ordered IDs keep SQLite's (queue, id) index appending at its end;
+            // random IDs dirtied a different index page per message, which made
+            // durable commits write about four times as much.
+            id: request.id.unwrap_or_else(|| Uuid::now_v7().to_string()),
             receipt_handle: None,
             body: request.body,
             attributes: request.attributes,

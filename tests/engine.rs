@@ -112,6 +112,21 @@ fn delays_visibility_and_statistics_match_upstream_boundaries() {
 }
 
 #[test]
+fn message_ids_sort_in_send_order() {
+    let mut manager = manager();
+    let ids: Vec<String> = (0..1000)
+        .map(|i| {
+            manager
+                .send_message("q", SendMessage::body(format!("m{i}")), 0)
+                .unwrap()
+                .id
+        })
+        .collect();
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(ids.iter().all(|id| uuid::Uuid::parse_str(id).is_ok()));
+}
+
+#[test]
 fn stale_receipts_cannot_delete_or_change_visibility() {
     let mut manager = manager();
     manager
