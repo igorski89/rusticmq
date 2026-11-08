@@ -201,21 +201,21 @@ suites and stops the server. CI runs these suites as well.
 ## Performance
 
 Compared with ElasticMQ 1.7.1 as `linux/arm64` containers under the same limits,
-RusticMQ 0.4.0 ties ElasticMQ native on durable concurrent sends, receives twice as
-fast as native and as fast as the JVM build, and is the only one that lost no
-acknowledged message when killed.
-The ElasticMQ JVM build is about twice as fast at concurrent sends. These are medians
-on one laptop's Docker VM:
+RusticMQ 0.5.0 ties the ElasticMQ JVM build on durable concurrent sends and is 1.7
+times as fast as native. It receives 2.5 times as fast as the JVM build, and is the
+only one that lost no acknowledged message when killed. In memory mode it ties
+ElasticMQ native under concurrent load, and the JVM build is about twice as fast at
+concurrent sends. These are medians on one laptop's Docker VM:
 
 | | RusticMQ | ElasticMQ native | ElasticMQ JVM |
 | --- | --- | --- | --- |
-| Send, 64 connections, durable (msg/s) | 16,277 | 17,199 | 31,901 |
-| Receive and delete, 64 connections, durable (msg/s) | 20,221 | 10,041 | 18,416 |
-| Send, 64 connections, in memory (msg/s) | 21,675 | 29,966 | 53,753 |
-| Send, 1 connection, in memory (msg/s) | 5,122 | 2,907 | 3,610 |
-| Startup (ms) | 58 | 121 | 1,217 |
-| Idle process memory (MiB) | 0.3 | 14.8 | 151 |
-| Acknowledged sends lost after `SIGKILL`, three rounds | 0, 0, 0 | 1,942, 2,814, 3,995 | 2,662, 2,262, 3,143 |
+| Send, 64 connections, durable (msg/s) | 28,662 | 16,739 | 30,816 |
+| Receive and delete, 64 connections, durable (msg/s) | 45,674 | 10,077 | 18,091 |
+| Send, 64 connections, in memory (msg/s) | 25,765 | 27,948 | 53,488 |
+| Send, 1 connection, in memory (msg/s) | 6,151 | 2,893 | 3,721 |
+| Startup (ms) | 61 | 97 | 1,048 |
+| Idle process memory (MiB) | 0.3 | 14.8 | 150 |
+| Acknowledged sends lost after `SIGKILL`, three rounds | 0, 0, 0 | 5,230, 2,058, 2,300 | 2,854, 2,645, 2,686 |
 
 See [BENCHMARKS.md](BENCHMARKS.md) for the method, all results and their limits.
 

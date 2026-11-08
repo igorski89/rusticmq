@@ -56,7 +56,7 @@ def elastic(image):
 
 SERVERS = {
     "rusticmq": {
-        "image": "localhost:5555/igorski89/rusticmq:0.4.0",
+        "image": "localhost:5555/igorski89/rusticmq:0.5.0",
         "options": lambda storage: ["--mount", f"type=bind,source={CONF}/rusticmq.conf,target=/opt/bench.conf,readonly"],
         "args": lambda storage: ["--config", "/opt/bench.conf"] + (["--data-dir", "/data"] if storage == "durable" else []),
     },
