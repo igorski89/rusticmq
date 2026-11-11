@@ -18,8 +18,8 @@ from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_TESTS = {"rust": 77, "aws_sdk": 14, "query": 3, "restart": 5, "container": 1,
-    "upstream_java": 150, "upstream_node": 5}
+EXPECTED_TESTS = {"rust": 90, "aws_sdk": 14, "query": 3, "restart": 5, "container": 1,
+    "upstream_java": 164, "upstream_node": 5}
 
 
 def check_test_count(log_path, suite):

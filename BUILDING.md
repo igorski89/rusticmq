@@ -199,7 +199,7 @@ state across three container replacements without relying on tools in the image.
 ## Full Docker verification
 
 The complete audit builds and tests both `linux/amd64` and `linux/arm64`, including
-all 77 Rust tests in the musl builder, all 150 original Java SDK scenarios and
+all 90 Rust tests in the musl builder, all 164 original Java SDK scenarios and
 five original Node.js SDK tests against the runtime image, boto3 and Query/XML
 workflows, container/process restarts, named-volume persistence and the concurrent
 standard/FIFO load check:

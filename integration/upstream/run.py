@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-REFERENCE = "b2abbc62954851b5244211fba75c3ac83fb6e0b2"
+REFERENCE = "c7dee33988cd6ebec4793816b13f9c8a16c6367c"
 root = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("source", nargs="?", default=str(Path.home() / "Work/elasticmq"))

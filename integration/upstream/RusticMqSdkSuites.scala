@@ -10,7 +10,7 @@ import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.sqs.{SqsClient => AmazonSqsV2}
 
 import java.net.URI
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 // Run the original test traits without starting their embedded JVM server.
 // Queue cleanup gives each original scenario a fresh RusticMQ queue namespace.

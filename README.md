@@ -1,7 +1,8 @@
 # RusticMQ
 
 A Rust port of [ElasticMQ](https://github.com/softwaremill/elasticmq), based on
-upstream commit `b2abbc62954851b5244211fba75c3ac83fb6e0b2`.
+upstream commit `c7dee33988cd6ebec4793816b13f9c8a16c6367c` (ElasticMQ 2.0.0-rc1
+and one dependency update).
 The backend is implemented in Rust; the Web UI is excluded.
 
 For prerequisites and release builds on **macOS, Linux and Windows**, see
@@ -16,7 +17,8 @@ cargo run
 
 The SQS endpoint listens on `0.0.0.0:9324`. `GET /health` returns `OK`.
 AWS SDK clients can use `http://localhost:9324`, region `elasticmq`, and any local
-credentials. Returned queue URLs use account `000000000000`.
+credentials. Returned queue URLs use the host and port the client connected to,
+and account `000000000000`.
 
 Storage uses SQLite in memory by default. Specify a data directory for durable
 queues and messages, including visibility state and receipt handles:
@@ -39,6 +41,52 @@ again afterwards can keep messages that the older version received hidden until
 an earlier visibility timeout expires, and their receipt handles stop working.
 No message is lost either way.
 
+### Upgrading to 0.6.0
+
+0.6.0 follows ElasticMQ 2.0, which changes some defaults. The data directory
+format is unchanged, so 0.5.x can still open a directory used by 0.6.0; it
+ignores the new queue attributes.
+
+- **Messages expire.** `MessageRetentionPeriod` is enforced. With the default
+  strict limits, a queue that doesn't set it keeps messages for 4 days (345600
+  seconds). With `rest-sqs.sqs-limits = relaxed`, such messages never expire, as
+  before. A value set on the queue always applies, including to messages already
+  on it. Expired messages are deleted within about a second, whether visible or
+  in flight, and are not sent to a dead-letter queue. Messages moved to a
+  dead-letter queue keep their original send time.
+  **With strict limits, persisted messages older than 4 days are deleted on the
+  first start of 0.6.0.** To keep them, set `sqs-limits = relaxed` or set
+  `message-retention-period` on the affected queues before upgrading.
+- **Message size counts bytes.** The limit counts the body plus each attribute's
+  name, data type and value, in UTF-8 bytes, as SQS does. It is the queue's
+  `MaximumMessageSize`, or 1 MiB with strict limits and unlimited with relaxed
+  limits. A larger message fails with `InvalidParameterValue` and
+  `Message must be shorter than <limit> bytes`. A `SendMessageBatch` over 1 MiB in
+  total fails with `AWS.SimpleQueueService.BatchRequestTooLong`, with strict
+  limits.
+- **Queue URLs follow the request.** `node-address.host` now defaults to `"*"`, so
+  a client connecting as `http://rusticmq:9324` gets queue URLs with that host.
+  Clients connecting to `localhost:9324` see no change. To fix the address, set
+  `RUSTICMQ_BASE_URL` or `node-address.host`. Routing of requests is unchanged.
+- **Configuration keys are kebab-case**, such as `default-visibility-timeout`
+  instead of `defaultVisibilityTimeout`; the table is below. The old keys still
+  work and log a deprecation warning. If both are set, the old key wins. The
+  `queues-storage` file is now written with the new keys, which 0.5.x can't read.
+
+| 1.x key | 2.0 key |
+| --- | --- |
+| `aws.accountId` | `aws.account-id` |
+| `defaultVisibilityTimeout` | `default-visibility-timeout` |
+| `receiveMessageWait` | `receive-message-wait` |
+| `deadLettersQueue { maxReceiveCount }` | `dead-letters-queue { max-receive-count }` |
+| `contentBasedDeduplication` | `content-based-deduplication` |
+| `copyTo` | `copy-to` |
+| `moveTo` | `move-to` |
+
+Queue definitions and the `auto-create-queues.template` also accept
+`message-retention-period` (a duration, such as `4 days`) and
+`maximum-message-size` (bytes, such as `262144` or `256K`).
+
 H2 database compatibility is excluded. HOCON (Human-Optimized Config Object Notation) is the
 configuration format used by ElasticMQ: it supports readable objects, comments,
 includes and duration values. Existing ElasticMQ HOCON files configure startup
@@ -46,7 +94,7 @@ queues, durations, routing, tags, server addresses and context paths. For exampl
 
 ```hocon
 queues {
-  jobs { defaultVisibilityTimeout = 30 seconds }
+  jobs { default-visibility-timeout = 30 seconds }
 }
 ```
 
@@ -71,7 +119,7 @@ Additional environment variables configure the server:
 | Variable | Default |
 | --- | --- |
 | `RUSTICMQ_BIND` | `0.0.0.0:9324` |
-| `RUSTICMQ_BASE_URL` | `http://localhost:9324` |
+| `RUSTICMQ_BASE_URL` | Each request's host, e.g. `http://localhost:9324` |
 | `RUSTICMQ_REGION` | `elasticmq` |
 | `RUSTICMQ_ACCOUNT_ID` | `000000000000` |
 | `RUSTICMQ_QUEUES_STORAGE` | Disabled (queue definitions file only) |
@@ -80,6 +128,8 @@ Additional environment variables configure the server:
 
 - Standard and FIFO queue engine, delays, visibility timeouts, receipt handles,
   deduplication, receive attempts, dead-letter routing, copy/move routes and tags.
+- Message retention periods and per-queue maximum message sizes, as in
+  ElasticMQ 2.0.
 - SQS JSON and Query/XML: queue lifecycle, attributes and tags; send, receive,
   delete and visibility actions, including batches; queue and dead-letter-source
   listing; permission actions as upstream no-ops.
@@ -105,6 +155,7 @@ Additional environment variables configure the server:
 | `rusticmq_messages_deduplicated_total` | counter | FIFO sends accepted but not stored as duplicates |
 | `rusticmq_messages_received_total` | counter | Messages delivered by receives |
 | `rusticmq_messages_deleted_total` | counter | Messages deleted by receipt handle |
+| `rusticmq_messages_expired_total` | counter | Messages deleted for exceeding the queue's retention period |
 | `rusticmq_queue_last_send_timestamp_seconds` | gauge | Last send, stored or deduplicated |
 | `rusticmq_queue_last_receive_timestamp_seconds` | gauge | Last receive request, including empty receives |
 | `rusticmq_message_body_bytes` | histogram | Stored message body sizes, buckets from 1 KiB to 256 MiB |
@@ -119,7 +170,7 @@ defined by the configuration) and `rusticmq_config_max_content_length_bytes`
 the queue is created; a timestamp is absent until the first send or receive. A
 queue whose messages wait while its last receive grows old has no live consumer.
 
-The original Java SDK v1/v2 suites pass all 150 scenarios against RusticMQ, and
+The original Java SDK v1/v2 suites pass all 164 scenarios against RusticMQ, and
 the original Node.js AWS SDK suite passes all five tests. Additional Rust, boto3,
 Query/XML, process-restart and container checks cover the SQLite replacement and
 server behavior. See [PORTING.md](PORTING.md) for the verification matrix.

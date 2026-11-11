@@ -1,7 +1,8 @@
 # ElasticMQ Rust backend port
 
-Reference: ElasticMQ commit `b2abbc62954851b5244211fba75c3ac83fb6e0b2` in
-`/Users/igorievsiukov/Work/elasticmq`.
+Reference: ElasticMQ commit `c7dee33988cd6ebec4793816b13f9c8a16c6367c` (2.0.0-rc1 and
+one dependency update) from https://github.com/softwaremill/elasticmq. Until 0.5.1
+the reference was 1.x commit `b2abbc62954851b5244211fba75c3ac83fb6e0b2`.
 
 The requested backend is implemented. The Web UI is excluded by instruction.
 SQLite replaces the JVM database format; storage defaults to `:memory:` and a
@@ -11,13 +12,13 @@ file path enables durable queues and messages. H2 file compatibility is excluded
 
 | Backend requirement | Implementation | Verification |
 | --- | --- | --- |
-| Standard/FIFO queues, delays, visibility, receipt handles, statistics, deduplication, receive attempts, tags and queue lifecycle | `src/engine.rs`, `src/model.rs` | 31 engine tests; original Java SDK scenarios; concurrent standard/FIFO delivery workload |
+| Standard/FIFO queues, delays, visibility, receipt handles, statistics, deduplication, receive attempts, tags and queue lifecycle | `src/engine.rs`, `src/model.rs` | 37 engine tests; original Java SDK scenarios; concurrent standard/FIFO delivery workload |
 | Dead-letter routing, copy/move routing and bound destination identity | Queue engine and startup dependency ordering | Engine tests for deleted/recreated destinations, late destinations, DLQ copies and receive retries; original SDK DLQ scenarios |
-| All 23 upstream SQS actions in JSON and Query/XML | `src/sqs` | 28 Rust HTTP/protocol tests; 150 original Java SDK tests; five original Node.js SDK tests; 14 boto3 checks; three Query/XML workflows exercising all 23 actions |
+| All 23 upstream SQS actions in JSON and Query/XML | `src/sqs` | 37 Rust HTTP/protocol tests; 164 original Java SDK tests; five original Node.js SDK tests; 14 boto3 checks; three Query/XML workflows exercising all 23 actions |
 | Attributes, MD5 digests, binary values, trace headers, validation, batch failures and SDK errors | Protocol conversion and request handlers | Original unchanged Java SDK assertions, including binary attributes, empty custom types and typed JSON exceptions; Rust and Query/XML regression tests |
 | Long polling and concurrent consumers | Shared serialized engine with polling outside the mutex | Rust concurrent polling tests; SDK polling scenarios; eight-thread load check |
 | Asynchronous message move tasks, rate limits, cancellation and history | Engine tasks and background worker | Engine, Rust HTTP, boto3, original Java SDK and Query/XML tests; persistence failures are retried before further moves |
-| Durable SQLite updates, deletes, visibility and startup restore | Transactional SQLite with foreign keys, WAL and full synchronization; messages are stored as sent, and receives and visibility changes update a separate state row | 13 persistence tests, including FIFO order/group blocking/deduplication/sequence restore; four real process-restart checks; container replacement check |
+| Durable SQLite updates, deletes, visibility and startup restore | Transactional SQLite with foreign keys, WAL and full synchronization; messages are stored as sent, and receives and visibility changes update a separate state row | 16 persistence tests, including FIFO order/group blocking/deduplication/sequence restore; four real process-restart checks; container replacement check |
 | Queue definitions file, startup queues, routing, durations and tags | Atomic definitions writes and HOCON loader | Persistence tests and a process-restart configuration/copy-route test |
 | Server defaults, context paths, wildcard URLs, automatic creation, relaxed limits, CORS, health and shutdown | `src/config.rs`, `src/main.rs`, SQS router | Rust HTTP/configuration tests; original SDK health test; process and container lifecycle checks |
 | Native metrics, executable/container packaging, embedding and documentation | `/metrics`, Dockerfile, Compose, README, library API | Gauge regression test; non-root Docker build and named-volume check; CI formatting, Clippy, Rust and integration suites |
@@ -27,12 +28,28 @@ behavior follows this upstream revision: `MaxResults` and `NextToken` do not
 paginate `ListQueues` or `ListDeadLetterSourceQueues`. Permission actions remain
 upstream-compatible no-ops.
 
+## ElasticMQ 2.0 alignment
+
+0.6.0 ports the SQS-visible changes between the 1.x reference and 2.0.0-rc1. The
+JVM-only changes (embedding API, Pekko types, module layout, Scala and Java
+baselines, the native image) have no counterpart here.
+
+| Upstream change | RusticMQ |
+| --- | --- |
+| `MessageRetentionPeriod` enforced: 4 days under strict limits, never under relaxed ones unless set (#1277) | Expired messages are skipped by receives and statistics and deleted by a 1-second sweep through the database writer. A per-queue lower bound on message creation time keeps the sweep from scanning queues with nothing to expire. New `rusticmq_messages_expired_total` metric |
+| Per-queue `MaximumMessageSize`; size counts UTF-8 bytes of the body and attributes; `BatchRequestTooLong` (#1277) | Checked under the engine lock against a size computed before it, in upstream's error order |
+| Kebab-case configuration keys; 1.x keys read with a warning, the old key winning (#1276) | Same, including the `queues-storage` writer. Warnings name the key and file, but not the line: the vendored HOCON parser keeps no positions |
+| Queue URLs from the request by default, built from the scheme, `Host` and context path (#1276) | Same. `RUSTICMQ_BASE_URL` or `node-address.host` fixes them. The per-request base no longer copies the server configuration |
+| Auto-created queues no longer dated 1970; quoted dotted tag keys load (#1276) | Neither problem existed here; both have tests |
+| Attribute names matched exactly or by `prefix.*` (#1268) | `prefix.*` now requires the dot, as upstream |
+| Queue events carry message snapshots (#1270) | Events already carry copies |
+
 ## Original SDK audit
 
 `integration/upstream/run.py` archives the pinned reference into
 `target/upstream-audit`, adds external-server fixtures, starts RusticMQ and runs
 the original scenario traits. The original checkout, test scenarios and assertions
-are unchanged. Both Java SDK versions pass all 75 scenarios each, for 150 total.
+are unchanged. Both Java SDK versions pass all 82 scenarios each, for 164 total.
 The original Node.js suite uses its existing local-server mode and passes five
 tests. The runner supports Homebrew sbt or a standalone launcher JAR, and CI runs
 both suites against the pinned source.

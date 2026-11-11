@@ -51,10 +51,14 @@ class ContainerTests(unittest.TestCase):
                     config=Config(retries={"max_attempts": 0}))
                 if generation == 0:
                     url = client.create_queue(QueueName="durable", tags={"runtime": "container"})["QueueUrl"]
+                    self.assertEqual(url, endpoint + "/000000000000/durable")
                     client.send_message(QueueUrl=url, MessageBody="on disk")
                     message = client.receive_message(QueueUrl=url)["Messages"][0]
                 else:
-                    self.assertEqual(client.get_queue_url(QueueName="durable")["QueueUrl"], url)
+                    # Queue URLs follow the address the client connected to,
+                    # which changes with each container's published port.
+                    url = client.get_queue_url(QueueName="durable")["QueueUrl"]
+                    self.assertEqual(url, endpoint + "/000000000000/durable")
                     self.assertEqual(client.list_queue_tags(QueueUrl=url)["Tags"], {"runtime": "container"})
                     self.assertFalse(client.receive_message(QueueUrl=url).get("Messages"))
                     if generation == 2:

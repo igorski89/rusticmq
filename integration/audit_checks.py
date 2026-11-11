@@ -34,13 +34,13 @@ class AuditEvidenceTests(unittest.TestCase):
                 self.check("rust", incomplete)
 
     def test_upstream_evidence_requires_both_java_and_node_results(self):
-        output = "[info] Tests: succeeded 150, failed 0, canceled 0, ignored 0, pending 0\nTests:       5 passed, 5 total\n"
-        self.assertEqual(self.check("upstream_java", output), 150)
+        output = "[info] Tests: succeeded 164, failed 0, canceled 0, ignored 0, pending 0\nTests:       5 passed, 5 total\n"
+        self.assertEqual(self.check("upstream_java", output), 164)
         self.assertEqual(self.check("upstream_node", output), 5)
         with self.assertRaises(RuntimeError):
             self.check("upstream_node", "[info] All tests passed.\n")
         with self.assertRaises(RuntimeError):
-            self.check("upstream_java", output.replace("succeeded 150", "succeeded 149"))
+            self.check("upstream_java", output.replace("succeeded 164", "succeeded 163"))
 
     def test_process_suite_cannot_silently_run_fewer_tests(self):
         self.assertEqual(self.check("restart", "Ran 5 tests in 2.000s\n\nOK\n"), 5)

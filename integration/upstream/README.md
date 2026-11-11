@@ -21,15 +21,16 @@ python3 integration/upstream/run.py ~/Work/elasticmq --nodejs
 Port 9321 must be free. Logs and original ScalaTest reports are under
 `target/upstream-audit`. The original checkout is never edited.
 
-The upstream reference is commit `b2abbc62954851b5244211fba75c3ac83fb6e0b2`.
+The upstream reference is commit `c7dee33988cd6ebec4793816b13f9c8a16c6367c`,
+ElasticMQ 2.0.0-rc1 and one dependency update. Its Node.js tests require Node.js 26.
 
 `--nodejs` additionally runs the original five Node.js AWS SDK tests in their
 existing local-server mode. It requires Node.js/npm; omit the flag for Java only.
-All 150 Java SDK tests (75 per SDK version) and five Node.js tests pass.
+All 164 Java SDK tests (82 per SDK version) and five Node.js tests pass.
 
 Outside Homebrew, set `JAVA_HOME` to your JDK. Either put `sbt` on PATH or set
 `RUSTICMQ_SBT_LAUNCHER` to the absolute path of a standalone sbt launcher JAR.
-CI uses JDK 21, Node.js 24 and the sbt 2.0.10 launcher with the pinned upstream
+CI uses JDK 21, Node.js 26 and the sbt 2.0.12 launcher with the pinned upstream
 source. ScalaTest XML reports are under the isolated checkout's
 `target/out/**/test-reports` directory.
 
