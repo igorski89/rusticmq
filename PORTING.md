@@ -125,6 +125,23 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
+## 0.6.0 Docker publication
+
+The images from release commit `c4c4395` are published to
+`localhost:5555/igorski89/rusticmq:latest`, `:0.6.0` and `:c4c4395`. All three
+tags point to the same AMD64/ARM64 manifest index:
+
+```text
+sha256:19134c867a27050175937d4a9df25b4e301d4e1189732480063319a447755328
+```
+
+0.6.0 follows ElasticMQ 2.0.0-rc1: message retention and per-queue maximum size
+are enforced, queue URLs follow the request, and configuration keys are
+kebab-case. The full Docker audit passed 282 tests on ARM64 locally, with 90 Rust
+tests and the original 2.0 suites (164 Java SDK and five Node.js tests), and CI
+run 43117490845 passed it on native AMD64 and ARM64 runners. Both published
+architectures passed a smoke test.
+
 ## 0.5.1 Docker publication
 
 The images from release commit `8c8ccd3` are published to
