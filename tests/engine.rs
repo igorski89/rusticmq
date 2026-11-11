@@ -868,3 +868,128 @@ fn delivery_indexes_track_visibility_replacement_purge_and_snapshot_restore() {
     assert_eq!(restored.next_delivery("q").unwrap(), None);
     assert!(receive(&mut restored, "q", 1, 100_000).is_empty());
 }
+
+const DAY: i64 = 24 * 60 * 60 * 1000;
+
+#[test]
+fn strict_limits_expire_messages_after_four_days() {
+    let mut manager = manager();
+    manager
+        .send_message("q", SendMessage::body("old"), 0)
+        .unwrap();
+    manager
+        .send_message("q", SendMessage::body("new"), DAY)
+        .unwrap();
+    manager.drain_events();
+    // Not yet expired: retention is four days from each message's send time.
+    assert_eq!(manager.expire_messages(4 * DAY - 1), 0);
+    // Before the periodic sweep, an expired message is neither counted nor delivered.
+    assert_eq!(manager.statistics("q", 4 * DAY + 1).unwrap().visible, 1);
+    let received = receive(&mut manager, "q", 10, 4 * DAY);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].body, "new");
+    let removed: Vec<_> = manager
+        .drain_events()
+        .into_iter()
+        .filter(|event| matches!(event, QueueEvent::MessageRemoved { .. }))
+        .collect();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(manager.activity("q").unwrap().expired, 1);
+    assert_eq!(manager.messages("q").unwrap().len(), 1);
+    // In-flight messages expire too.
+    assert_eq!(manager.expire_messages(5 * DAY), 1);
+    assert!(manager.messages("q").unwrap().is_empty());
+}
+
+#[test]
+fn relaxed_limits_keep_messages_unless_the_queue_sets_a_retention_period() {
+    let mut manager = QueueManager::new();
+    manager.set_relaxed_limits(true);
+    manager
+        .create_queue(CreateQueue::named("forever"), 0)
+        .unwrap();
+    manager
+        .create_queue(
+            CreateQueue {
+                message_retention_seconds: Some(60),
+                ..CreateQueue::named("minute")
+            },
+            0,
+        )
+        .unwrap();
+    for queue in ["forever", "minute"] {
+        manager
+            .send_message(queue, SendMessage::body("m"), 0)
+            .unwrap();
+    }
+    assert_eq!(
+        manager.message_retention_seconds(manager.queue("forever").unwrap()),
+        None
+    );
+    assert_eq!(manager.expire_messages(365 * DAY), 1);
+    assert_eq!(manager.messages("forever").unwrap().len(), 1);
+    assert!(manager.messages("minute").unwrap().is_empty());
+}
+
+#[test]
+fn lowering_the_retention_period_applies_to_existing_messages() {
+    let mut manager = manager();
+    manager
+        .send_message("q", SendMessage::body("m"), 0)
+        .unwrap();
+    assert_eq!(manager.expire_messages(2 * DAY), 0);
+    let mut config = manager.queue("q").unwrap().clone();
+    config.message_retention_seconds = Some(60);
+    manager.update_queue(config).unwrap();
+    assert_eq!(manager.expire_messages(2 * DAY), 1);
+}
+
+#[test]
+fn dead_lettered_messages_keep_their_original_send_time() {
+    let mut manager = QueueManager::new();
+    manager.create_queue(CreateQueue::named("dlq"), 0).unwrap();
+    manager
+        .create_queue(
+            CreateQueue {
+                visibility_timeout_ms: Some(0),
+                dead_letter_queue: Some(DeadLetterQueue {
+                    name: "dlq".into(),
+                    max_receive_count: 1,
+                }),
+                ..CreateQueue::named("source")
+            },
+            0,
+        )
+        .unwrap();
+    manager
+        .send_message("source", SendMessage::body("m"), 0)
+        .unwrap();
+    assert_eq!(receive(&mut manager, "source", 1, 3 * DAY).len(), 1);
+    assert!(receive(&mut manager, "source", 1, 3 * DAY + 1).is_empty());
+    assert_eq!(manager.messages("dlq").unwrap().len(), 1);
+    assert_eq!(manager.expire_messages(4 * DAY), 1);
+    assert!(manager.messages("dlq").unwrap().is_empty());
+}
+
+#[test]
+fn create_queue_compares_retention_and_maximum_size() {
+    let mut manager = QueueManager::new();
+    let request = CreateQueue {
+        message_retention_seconds: Some(120),
+        maximum_message_size: Some(2048),
+        ..CreateQueue::named("q")
+    };
+    manager.create_queue(request.clone(), 0).unwrap();
+    assert!(manager.create_queue(request, 1).is_ok());
+    assert!(manager.create_queue(CreateQueue::named("q"), 1).is_ok());
+    assert!(matches!(
+        manager.create_queue(
+            CreateQueue {
+                maximum_message_size: Some(1024),
+                ..CreateQueue::named("q")
+            },
+            1
+        ),
+        Err(Error::QueueAlreadyExists(_))
+    ));
+}

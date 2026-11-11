@@ -4,6 +4,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+/// SQS's default `MessageRetentionPeriod`, applied under strict limits.
+pub const STRICT_MESSAGE_RETENTION_SECONDS: u64 = 4 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Deduplicated {
     message: Message,
@@ -47,6 +50,10 @@ struct Queue {
     previous_moves: Vec<MessageMoveTask>,
     #[serde(skip)]
     activity: QueueActivity,
+    /// No message was created before this time; `None` until computed. It lets
+    /// the periodic expiry skip queues without scanning their messages.
+    #[serde(skip)]
+    oldest_created: Option<Timestamp>,
 }
 
 /// Derived indexes are rebuilt lazily after deserialization; SQLite and engine
@@ -173,6 +180,38 @@ impl Queue {
         }
     }
 
+    /// Remove messages created at or before `cutoff`, returning their IDs.
+    fn expire(&mut self, cutoff: Timestamp) -> Vec<String> {
+        let messages = &self.messages;
+        let oldest = *self.oldest_created.get_or_insert_with(|| {
+            messages
+                .values()
+                .map(|m| m.created)
+                .min()
+                .unwrap_or(Timestamp::MAX)
+        });
+        if oldest > cutoff {
+            return Vec::new();
+        }
+        let expired: Vec<String> = self
+            .messages
+            .values()
+            .filter(|message| message.created <= cutoff)
+            .map(|message| message.id.clone())
+            .collect();
+        for id in &expired {
+            self.remove_message(id);
+        }
+        self.oldest_created = Some(
+            self.messages
+                .values()
+                .map(|message| message.created)
+                .min()
+                .unwrap_or(Timestamp::MAX),
+        );
+        expired
+    }
+
     fn refresh_history(&mut self, message: &Message) {
         if let Some(entry) = message
             .deduplication_id
@@ -254,6 +293,7 @@ impl QueueManager {
                 moving: None,
                 previous_moves: Vec::new(),
                 activity: QueueActivity::default(),
+                oldest_created: Some(Timestamp::MAX),
             },
         );
         self.events.push(QueueEvent::QueueCreated(config.clone()));
@@ -283,6 +323,7 @@ impl QueueManager {
         let ids = queue.messages.keys().cloned().collect::<Vec<_>>();
         queue.messages.clear();
         queue.delivery = Some(DeliveryIndex::default());
+        queue.oldest_created = Some(Timestamp::MAX);
         queue.deduplication.clear();
         self.events
             .extend(ids.into_iter().map(|id| QueueEvent::MessageRemoved {
@@ -538,6 +579,9 @@ impl QueueManager {
                     message: message.clone(),
                 });
         }
+        if let Some(oldest) = &mut queue.oldest_created {
+            *oldest = (*oldest).min(message.created);
+        }
         if let Some(previous) = queue.messages.insert(message.id.clone(), message.clone()) {
             queue.reindex(&previous, &message);
         } else if let Some(index) = &mut queue.delivery {
@@ -556,6 +600,8 @@ impl QueueManager {
         request: ReceiveMessages,
         now: Timestamp,
     ) -> Result<Vec<Message>, Error> {
+        // Expired messages are never delivered, even before the periodic sweep.
+        self.expire_queue(name, now)?;
         let queue = self.get_mut(name)?;
         queue.activity.last_receive = Some(now);
         let cached = request
@@ -756,7 +802,14 @@ impl QueueManager {
 
     pub fn statistics(&self, name: &str, now: Timestamp) -> Result<QueueStatistics, Error> {
         let mut stats = QueueStatistics::default();
-        for message in self.get(name)?.messages.values() {
+        let queue = self.get(name)?;
+        // Expired messages awaiting the periodic sweep are not counted.
+        let cutoff = self.expiry_cutoff(&queue.config, now);
+        for message in queue
+            .messages
+            .values()
+            .filter(|message| cutoff.is_none_or(|cutoff| message.created > cutoff))
+        {
             // Match upstream GetQueueStatistics's strict comparison at the boundary.
             if message.next_delivery < now {
                 stats.visible += 1;
@@ -767,6 +820,47 @@ impl QueueManager {
             }
         }
         Ok(stats)
+    }
+
+    /// How long the queue keeps messages: its `MessageRetentionPeriod`, or
+    /// four days under strict limits. `None` keeps them forever.
+    pub fn message_retention_seconds(&self, config: &QueueConfig) -> Option<u64> {
+        config
+            .message_retention_seconds
+            .or((!self.relaxed_limits).then_some(STRICT_MESSAGE_RETENTION_SECONDS))
+    }
+
+    /// Messages created at or before the returned time have expired.
+    fn expiry_cutoff(&self, config: &QueueConfig, now: Timestamp) -> Option<Timestamp> {
+        self.message_retention_seconds(config).map(|seconds| {
+            now.saturating_sub(i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX))
+        })
+    }
+
+    /// Delete messages older than their queue's retention period, from every
+    /// queue, and return how many were deleted. Run it periodically.
+    pub fn expire_messages(&mut self, now: Timestamp) -> usize {
+        let names: Vec<String> = self.queues.keys().cloned().collect();
+        names
+            .iter()
+            .map(|name| self.expire_queue(name, now).unwrap_or(0))
+            .sum()
+    }
+
+    fn expire_queue(&mut self, name: &str, now: Timestamp) -> Result<usize, Error> {
+        let Some(cutoff) = self.expiry_cutoff(&self.get(name)?.config, now) else {
+            return Ok(0);
+        };
+        let queue = self.get_mut(name)?;
+        let expired = queue.expire(cutoff);
+        queue.activity.expired += expired.len() as u64;
+        let count = expired.len();
+        self.events
+            .extend(expired.into_iter().map(|id| QueueEvent::MessageRemoved {
+                queue: name.into(),
+                id,
+            }));
+        Ok(count)
     }
 
     pub fn activity(&self, name: &str) -> Result<&QueueActivity, Error> {
@@ -1000,6 +1094,8 @@ impl QueueManager {
                     copy_messages_to: config.copy_messages_to.clone(),
                     move_messages_to: config.move_messages_to.clone(),
                     tags: config.tags.clone(),
+                    message_retention_seconds: config.message_retention_seconds,
+                    maximum_message_size: config.maximum_message_size,
                 },
                 config.created,
             )?;

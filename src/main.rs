@@ -46,8 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         app.queue_storage = Some(PathBuf::from(value));
     }
     let mut config = app.service;
+    // A fixed base URL replaces the default of following each request's host.
     if let Ok(value) = std::env::var("RUSTICMQ_BASE_URL") {
         config.base_url = value;
+        config.wildcard_queue_urls = false;
     }
     if let Ok(value) = std::env::var("RUSTICMQ_REGION") {
         config.region = value;
@@ -66,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(&app.bind).await?;
     if app.generate_node_address {
         config.base_url = format!("http://{}{}", listener.local_addr()?, config.context_path);
+        config.wildcard_queue_urls = false;
     }
     eprintln!("RusticMQ listening on {}", listener.local_addr()?);
     let service = SqsService::new(manager, config).with_persistence(persistence);

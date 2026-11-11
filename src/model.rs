@@ -51,6 +51,14 @@ pub struct QueueConfig {
     pub copy_messages_to: Option<String>,
     pub move_messages_to: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// `MessageRetentionPeriod` in seconds, when the queue sets it. Otherwise
+    /// strict limits keep messages for four days and relaxed limits forever.
+    #[serde(default)]
+    pub message_retention_seconds: Option<u64>,
+    /// `MaximumMessageSize` in bytes, when the queue sets it. Otherwise strict
+    /// limits allow 1 MiB and relaxed limits any size.
+    #[serde(default)]
+    pub maximum_message_size: Option<u32>,
 }
 
 /// Optional fields retain the distinction between an omitted creation attribute
@@ -67,6 +75,10 @@ pub struct CreateQueue {
     pub copy_messages_to: Option<String>,
     pub move_messages_to: Option<String>,
     pub tags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub message_retention_seconds: Option<u64>,
+    #[serde(default)]
+    pub maximum_message_size: Option<u32>,
 }
 
 impl CreateQueue {
@@ -93,6 +105,10 @@ impl CreateQueue {
             && (self.move_messages_to.is_none()
                 || self.move_messages_to == existing.move_messages_to)
             && (self.tags.is_empty() || self.tags == existing.tags)
+            && (self.message_retention_seconds.is_none()
+                || self.message_retention_seconds == existing.message_retention_seconds)
+            && (self.maximum_message_size.is_none()
+                || self.maximum_message_size == existing.maximum_message_size)
     }
 
     pub(crate) fn into_config(self, now: Timestamp) -> QueueConfig {
@@ -109,6 +125,8 @@ impl CreateQueue {
             copy_messages_to: self.copy_messages_to,
             move_messages_to: self.move_messages_to,
             tags: self.tags,
+            message_retention_seconds: self.message_retention_seconds,
+            maximum_message_size: self.maximum_message_size,
         }
     }
 }
@@ -261,6 +279,8 @@ pub struct QueueActivity {
     pub deduplicated: u64,
     pub received: u64,
     pub deleted: u64,
+    /// Messages deleted for exceeding the queue's retention period.
+    pub expired: u64,
     /// Last send addressed to this queue, whether stored or deduplicated.
     pub last_send: Option<Timestamp>,
     /// Last receive request, including empty ones and long-poll wakeups.

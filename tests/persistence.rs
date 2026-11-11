@@ -498,3 +498,142 @@ fn databases_without_message_state_are_upgraded_in_place() {
     assert_eq!(restored.messages("q").unwrap(), vec![again.clone()]);
     assert_eq!(again.receive_count, 2);
 }
+
+#[test]
+fn queue_definitions_use_kebab_case_keys_and_still_read_the_old_ones() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("elasticmq.conf");
+    fs::write(
+        &path,
+        r#"
+        aws { account-id = "111111111111" }
+        queues {
+            dlq {}
+            new {
+                default-visibility-timeout = 2 seconds
+                receive-message-wait = 3 seconds
+                content-based-deduplication = true
+                fifo = true
+                dead-letters-queue { name = "dlq.fifo", max-receive-count = 4 }
+                message-retention-period = 2 hours
+                maximum-message-size = 256K
+                tags { "app.team" = "rust" }
+            }
+            old {
+                defaultVisibilityTimeout = 5 seconds
+                default-visibility-timeout = 9 seconds
+                copyTo = "dlq"
+                deadLettersQueue { name = "dlq", maxReceiveCount = 2 }
+            }
+        }
+    "#,
+    )
+    .unwrap();
+    let config = AppConfig::load(Some(&path), 0).unwrap();
+    assert_eq!(config.service.account_id, "111111111111");
+    // Queue URLs follow the request unless a host is configured.
+    assert!(config.service.wildcard_queue_urls);
+    let queue = |name: &str| config.queues.iter().find(|q| q.name == name).unwrap();
+    let new = queue("new.fifo");
+    assert_eq!(new.visibility_timeout_ms, 2000);
+    assert_eq!(new.receive_wait_ms, 3000);
+    assert!(new.content_based_deduplication);
+    assert_eq!(new.dead_letter_queue.as_ref().unwrap().max_receive_count, 4);
+    assert_eq!(new.message_retention_seconds, Some(7200));
+    assert_eq!(new.maximum_message_size, Some(256 * 1024));
+    assert_eq!(new.tags["app.team"], "rust");
+    // As upstream, a 1.x key wins over its replacement.
+    let old = queue("old");
+    assert_eq!(old.visibility_timeout_ms, 5000);
+    assert_eq!(old.copy_messages_to.as_deref(), Some("dlq"));
+    assert_eq!(old.dead_letter_queue.as_ref().unwrap().max_receive_count, 2);
+    let legacy = directory.path().join("legacy.conf");
+    fs::write(&legacy, r#"aws { accountId = "222222222222" }"#).unwrap();
+    assert_eq!(
+        AppConfig::load(Some(&legacy), 0)
+            .unwrap()
+            .service
+            .account_id,
+        "222222222222"
+    );
+    let fixed = directory.path().join("fixed.conf");
+    fs::write(&fixed, r#"node-address { host = "localhost" }"#).unwrap();
+    assert!(
+        !AppConfig::load(Some(&fixed), 0)
+            .unwrap()
+            .service
+            .wildcard_queue_urls
+    );
+}
+
+#[test]
+fn the_queue_storage_file_is_written_with_the_new_keys_and_round_trips() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("queues.conf");
+    let store = Persistence::open(Some(path.clone()), None, false).unwrap();
+    let mut manager = QueueManager::new();
+    manager.create_queue(CreateQueue::named("dlq"), 0).unwrap();
+    manager
+        .create_queue(
+            CreateQueue {
+                visibility_timeout_ms: Some(2000),
+                dead_letter_queue: Some(DeadLetterQueue {
+                    name: "dlq".into(),
+                    max_receive_count: 3,
+                }),
+                message_retention_seconds: Some(120),
+                maximum_message_size: Some(2048),
+                tags: BTreeMap::from([("app.team".into(), "rust".into())]),
+                ..CreateQueue::named("q")
+            },
+            0,
+        )
+        .unwrap();
+    flush(&store, &mut manager);
+    let written = fs::read_to_string(&path).unwrap();
+    for key in [
+        "default-visibility-timeout",
+        "dead-letters-queue",
+        "max-receive-count",
+        "message-retention-period",
+        "maximum-message-size",
+        "last-modified",
+    ] {
+        assert!(written.contains(key), "{key} missing from {written}");
+    }
+    assert!(!written.contains("defaultVisibilityTimeout"));
+    let read = read_queue_file(&path, 1).unwrap();
+    let q = read.iter().find(|queue| queue.name == "q").unwrap();
+    assert_eq!(q, manager.queue("q").unwrap());
+}
+
+#[test]
+fn expired_messages_are_deleted_from_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let store = Persistence::open(None, Some(database.clone()), false).unwrap();
+    let mut manager = QueueManager::new();
+    manager.create_queue(CreateQueue::named("q"), 0).unwrap();
+    manager
+        .send_message("q", SendMessage::body("old"), 0)
+        .unwrap();
+    flush(&store, &mut manager);
+    drop(store);
+    // A 0.5.x database holds a message older than four days: the first sweep
+    // after the restart deletes it, from memory and from the database.
+    let store = Persistence::open(None, Some(database.clone()), false).unwrap();
+    let mut restored = store.restore(Vec::new(), 5 * 24 * 60 * 60 * 1000).unwrap();
+    assert_eq!(restored.messages("q").unwrap().len(), 1);
+    assert_eq!(restored.expire_messages(5 * 24 * 60 * 60 * 1000), 1);
+    flush(&store, &mut restored);
+    drop(store);
+    let store = Persistence::open(None, Some(database), false).unwrap();
+    assert!(
+        store
+            .restore(Vec::new(), 0)
+            .unwrap()
+            .messages("q")
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -26,11 +26,16 @@ impl AppConfig {
             loader = loader.load_file(path)?;
         }
         let doc = loader.hocon()?;
+        let origin = path.map_or_else(
+            || "the configuration".into(),
+            |path| path.display().to_string(),
+        );
         let rest = &doc["rest-sqs"];
         let bind_host = text(rest, "bind-hostname")?.unwrap_or_else(|| "0.0.0.0".into());
         let bind_port = port(rest, "bind-port", 9324)?;
         let node = &doc["node-address"];
-        let host = text(node, "host")?.unwrap_or_else(|| "localhost".into());
+        // Since 2.0, queue URLs follow each request's host unless a host is set.
+        let host = text(node, "host")?.unwrap_or_else(|| "*".into());
         let protocol = text(node, "protocol")?.unwrap_or_else(|| "http".into());
         let node_port = port(node, "port", 9324)?;
         let context = text(node, "context-path")?.unwrap_or_default();
@@ -52,7 +57,7 @@ impl AppConfig {
             };
             let queues = Hocon::Hash([("template".into(), template)].into_iter().collect());
             let document = Hocon::Hash([("queues".into(), queues)].into_iter().collect());
-            Some(read_queues(&document, now)?.remove(0))
+            Some(read_queues(&document, now, &origin, "auto-create-queues")?.remove(0))
         } else {
             None
         };
@@ -83,7 +88,8 @@ impl AppConfig {
                     format!("/{context}")
                 },
                 region: text(aws, "region")?.unwrap_or_else(|| "elasticmq".into()),
-                account_id: text(aws, "accountId")?.unwrap_or_else(|| "000000000000".into()),
+                account_id: text(aws, renamed(aws, "account-id", "accountId", "aws", &origin))?
+                    .unwrap_or_else(|| "000000000000".into()),
                 relaxed_limits,
                 auto_create_template,
                 wildcard_queue_urls: host == "*",
@@ -99,7 +105,7 @@ impl AppConfig {
                 configured_queues: 0,
                 persistent_storage: false,
             },
-            queues: read_queues(&doc, now)?,
+            queues: read_queues(&doc, now, &origin, "queues")?,
             queue_storage: if boolean(queues, "enabled", false)? {
                 Some(PathBuf::from(
                     text(queues, "path")?
@@ -128,10 +134,40 @@ fn port(doc: &Hocon, key: &str, default: u16) -> Result<u16, ConfigError> {
 }
 
 pub fn read_queue_file(path: &Path, now: i64) -> Result<Vec<QueueConfig>, ConfigError> {
-    read_queues(&HoconLoader::new().strict().load_file(path)?.hocon()?, now)
+    read_queues(
+        &HoconLoader::new().strict().load_file(path)?.hocon()?,
+        now,
+        &path.display().to_string(),
+        "queues",
+    )
 }
 
-pub fn read_queues(document: &Hocon, now: i64) -> Result<Vec<QueueConfig>, ConfigError> {
+/// The key to read: a 1.x camelCase key if present, with a deprecation warning,
+/// otherwise its 2.0 kebab-case replacement. As upstream, the old key wins.
+fn renamed<'k>(
+    document: &Hocon,
+    key: &'k str,
+    deprecated: &'k str,
+    section: &str,
+    origin: &str,
+) -> &'k str {
+    if absent(&document[deprecated]) {
+        return key;
+    }
+    eprintln!(
+        "Configuration key '{section}.{deprecated}' ({origin}) is deprecated and will be removed in a future release, use '{key}' instead"
+    );
+    deprecated
+}
+
+/// Reads queue definitions from `document["queues"]`. `origin` and `section`
+/// name them in deprecation warnings.
+pub fn read_queues(
+    document: &Hocon,
+    now: i64,
+    origin: &str,
+    section: &str,
+) -> Result<Vec<QueueConfig>, ConfigError> {
     let Hocon::Hash(queues) = &document["queues"] else {
         if absent(&document["queues"]) {
             return Ok(Vec::new());
@@ -141,6 +177,13 @@ pub fn read_queues(document: &Hocon, now: i64) -> Result<Vec<QueueConfig>, Confi
     queues
         .iter()
         .map(|(name, value)| {
+            let section = if section == "auto-create-queues" {
+                "auto-create-queues.template".to_owned()
+            } else {
+                format!("{section}.{name}")
+            };
+            let key =
+                |new: &'static str, old: &'static str| renamed(value, new, old, &section, origin);
             let fifo = boolean(value, "fifo", false)?;
             let name = if fifo && !name.ends_with(".fifo") {
                 format!("{name}.fifo")
@@ -149,21 +192,39 @@ pub fn read_queues(document: &Hocon, now: i64) -> Result<Vec<QueueConfig>, Confi
             };
             let mut request = CreateQueue::named(name);
             request.fifo = fifo;
-            request.content_based_deduplication =
-                boolean(value, "contentBasedDeduplication", false)?;
-            request.visibility_timeout_ms = duration(value, "defaultVisibilityTimeout")?;
+            request.content_based_deduplication = boolean(
+                value,
+                key("content-based-deduplication", "contentBasedDeduplication"),
+                false,
+            )?;
+            request.visibility_timeout_ms = duration(
+                value,
+                key("default-visibility-timeout", "defaultVisibilityTimeout"),
+            )?;
             request.delay_ms = duration(value, "delay")?;
-            request.receive_wait_ms = duration(value, "receiveMessageWait")?;
-            request.copy_messages_to = text(value, "copyTo")?.filter(|s| !s.is_empty());
-            request.move_messages_to = text(value, "moveTo")?.filter(|s| !s.is_empty());
-            if !absent(&value["deadLettersQueue"]) {
-                let dead_letters = &value["deadLettersQueue"];
-                let name =
-                    text(dead_letters, "name")?.ok_or("deadLettersQueue.name is required")?;
-                let count = dead_letters["maxReceiveCount"]
+            request.receive_wait_ms =
+                duration(value, key("receive-message-wait", "receiveMessageWait"))?;
+            request.copy_messages_to =
+                text(value, key("copy-to", "copyTo"))?.filter(|s| !s.is_empty());
+            request.move_messages_to =
+                text(value, key("move-to", "moveTo"))?.filter(|s| !s.is_empty());
+            let dead_letters_key = key("dead-letters-queue", "deadLettersQueue");
+            if !absent(&value[dead_letters_key]) {
+                let dead_letters = &value[dead_letters_key];
+                let name = text(dead_letters, "name")?
+                    .ok_or_else(|| format!("{dead_letters_key}.name is required"))?;
+                let section = format!("{section}.{dead_letters_key}");
+                let count_key = renamed(
+                    dead_letters,
+                    "max-receive-count",
+                    "maxReceiveCount",
+                    &section,
+                    origin,
+                );
+                let count = dead_letters[count_key]
                     .as_i64()
                     .filter(|count| (1..=1000).contains(count))
-                    .ok_or("Invalid maxReceiveCount")?;
+                    .ok_or_else(|| format!("Invalid {dead_letters_key}.{count_key}"))?;
                 request.dead_letter_queue = Some(DeadLetterQueue {
                     name,
                     max_receive_count: count as u32,
@@ -182,6 +243,21 @@ pub fn read_queues(document: &Hocon, now: i64) -> Result<Vec<QueueConfig>, Confi
                 value if absent(value) => BTreeMap::new(),
                 _ => return Err("tags must be an object".into()),
             };
+            request.message_retention_seconds = duration(value, "message-retention-period")?
+                .map(|millis| match millis / 1000 {
+                    0 => Err(ConfigError::from("Invalid message-retention-period")),
+                    seconds => Ok(seconds),
+                })
+                .transpose()?;
+            request.maximum_message_size = match &value["maximum-message-size"] {
+                size if absent(size) => None,
+                size => Some(
+                    size.as_bytes()
+                        .and_then(|bytes| u32::try_from(bytes).ok())
+                        .filter(|bytes| (1..=i32::MAX as u32).contains(bytes))
+                        .ok_or("Invalid maximum-message-size")?,
+                ),
+            };
             let created = if absent(&value["created"]) {
                 now
             } else {
@@ -190,12 +266,13 @@ pub fn read_queues(document: &Hocon, now: i64) -> Result<Vec<QueueConfig>, Confi
                     .ok_or("Invalid created timestamp")?
             };
             let mut queue = request.into_config(created);
-            queue.last_modified = if absent(&value["lastModified"]) {
+            let last_modified = key("last-modified", "lastModified");
+            queue.last_modified = if absent(&value[last_modified]) {
                 now
             } else {
-                value["lastModified"]
+                value[last_modified]
                     .as_i64()
-                    .ok_or("Invalid lastModified timestamp")?
+                    .ok_or_else(|| format!("Invalid {last_modified} timestamp"))?
             };
             Ok(queue)
         })

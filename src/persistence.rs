@@ -247,17 +247,24 @@ impl Persistence {
         let mut queues = serde_json::Map::new();
         for name in manager.list_queues(None) {
             let queue = manager.queue(&name)?;
+            // Written with the 2.0 keys; durations are bare milliseconds.
             let mut data = serde_json::json!({
-                "defaultVisibilityTimeout":queue.visibility_timeout_ms,"delay":queue.delay_ms,
-                "receiveMessageWait":queue.receive_wait_ms,"fifo":queue.fifo,
-                "contentBasedDeduplication":queue.content_based_deduplication,"tags":queue.tags,
-                "created":queue.created,"lastModified":queue.last_modified,
-                "copyTo":queue.copy_messages_to.as_deref().unwrap_or(""),
-                "moveTo":queue.move_messages_to.as_deref().unwrap_or(""),
+                "default-visibility-timeout":queue.visibility_timeout_ms,"delay":queue.delay_ms,
+                "receive-message-wait":queue.receive_wait_ms,"fifo":queue.fifo,
+                "content-based-deduplication":queue.content_based_deduplication,"tags":queue.tags,
+                "created":queue.created,"last-modified":queue.last_modified,
+                "copy-to":queue.copy_messages_to.as_deref().unwrap_or(""),
+                "move-to":queue.move_messages_to.as_deref().unwrap_or(""),
             });
             if let Some(dlq) = &queue.dead_letter_queue {
-                data["deadLettersQueue"] =
-                    serde_json::json!({"name":dlq.name,"maxReceiveCount":dlq.max_receive_count});
+                data["dead-letters-queue"] =
+                    serde_json::json!({"name":dlq.name,"max-receive-count":dlq.max_receive_count});
+            }
+            if let Some(seconds) = queue.message_retention_seconds {
+                data["message-retention-period"] = serde_json::json!(seconds.saturating_mul(1000));
+            }
+            if let Some(bytes) = queue.maximum_message_size {
+                data["maximum-message-size"] = serde_json::json!(bytes);
             }
             queues.insert(name, data);
         }

@@ -64,7 +64,7 @@ impl ApiError {
             "AWS.SimpleQueueService.NonExistentQueue" => "QueueDoesNotExist",
             "QueueAlreadyExists" => "QueueNameExists",
             "AWS.SimpleQueueService.UnsupportedOperation" => "UnsupportedOperation",
-            name => name,
+            name => name.strip_prefix("AWS.SimpleQueueService.").unwrap_or(name),
         };
         if name == "MissingParameter" {
             name.into()
@@ -139,10 +139,10 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    fn queue_url(&self, name: &str) -> String {
+    fn queue_url(&self, base_url: &str, name: &str) -> String {
         format!(
             "{}/{}/{name}",
-            self.base_url.trim_end_matches('/'),
+            base_url.trim_end_matches('/'),
             if self.account_id.is_empty() {
                 "queue"
             } else {
@@ -165,6 +165,9 @@ pub struct SqsService {
     writer: Option<crate::persistence::Writer>,
     too_large: Arc<TooLarge>,
     started: Timestamp,
+    /// This request's base for queue URLs, from its `Host` header, when queue
+    /// URLs follow the request (`node-address.host = "*"`).
+    request_base_url: Option<Arc<str>>,
 }
 
 /// Request bodies rejected for exceeding `max-content-length`. The action
@@ -204,10 +207,22 @@ impl SqsService {
             writer: None,
             too_large: Arc::default(),
             started: now(),
+            request_base_url: None,
         }
     }
 
+    fn queue_url(&self, name: &str) -> String {
+        let base = self
+            .request_base_url
+            .as_deref()
+            .unwrap_or(&self.config.base_url);
+        self.config.queue_url(base, name)
+    }
+
     pub fn router(self) -> Router {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(self.clone().expire_periodically());
+        }
         let router = Router::new()
             .route("/health", get(|| async { "OK" }))
             .route("/metrics", get(metrics));
@@ -237,9 +252,59 @@ impl SqsService {
         commit.wait().await.map_err(|error| error.message)
     }
 
+    /// Delete expired messages every second, as upstream does, until shutdown.
+    /// A queue whose messages can't expire costs one comparison per sweep.
+    async fn expire_periodically(self) {
+        let mut stopping = self.stopping.subscribe();
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = stopping.wait_for(|stopping| *stopping) => break,
+            }
+            let commit = {
+                let mut manager = self.manager.lock().await;
+                if manager.expire_messages(now()) == 0 {
+                    continue;
+                }
+                self.notify_change(&mut manager)
+            };
+            if let Err(error) = commit.wait().await {
+                eprintln!("Message expiry persistence: {}", error.message);
+            }
+        }
+    }
+
     /// Finish outstanding long polls before the HTTP server drains connections.
     pub fn shutdown(&self) {
         self.stopping.send_replace(true);
+    }
+
+    /// The largest message the queue accepts, in bytes; `None` for any size.
+    fn maximum_message_size(&self, queue: &QueueConfig) -> Option<u32> {
+        queue
+            .maximum_message_size
+            .or((!self.config.relaxed_limits).then_some(STRICT_MAXIMUM_MESSAGE_SIZE))
+    }
+
+    /// `MessageRetentionPeriod` in seconds: 60 seconds to 14 days under strict
+    /// limits, any positive value under relaxed limits.
+    fn retention_attribute(&self, attributes: &BTreeMap<String, String>) -> ApiResult<Option<u64>> {
+        let range = (!self.config.relaxed_limits).then_some(60..=14 * 24 * 60 * 60);
+        positive_attribute(attributes, "MessageRetentionPeriod", range, u64::MAX)
+    }
+
+    /// `MaximumMessageSize` in bytes: 1 KiB to 1 MiB under strict limits, any
+    /// positive 32-bit value under relaxed limits.
+    fn maximum_size_attribute(
+        &self,
+        attributes: &BTreeMap<String, String>,
+    ) -> ApiResult<Option<u32>> {
+        let range =
+            (!self.config.relaxed_limits).then_some(1024..=u64::from(STRICT_MAXIMUM_MESSAGE_SIZE));
+        positive_attribute(attributes, "MaximumMessageSize", range, i32::MAX as u64)
+            .map(|bytes| bytes.map(|bytes| bytes as u32))
     }
 
     fn wait_limit(&self) -> u64 {
@@ -272,6 +337,8 @@ impl SqsService {
                     copy_messages_to: template.copy_messages_to.clone(),
                     move_messages_to: template.move_messages_to.clone(),
                     tags: template.tags.clone(),
+                    message_retention_seconds: template.message_retention_seconds,
+                    maximum_message_size: template.maximum_message_size,
                 },
                 now,
             )?;
@@ -419,7 +486,7 @@ impl SqsService {
     fn prepare_send_batch(&self, p: &Value, tracing: Option<String>) -> PreparedBatch {
         let relaxed = self.config.relaxed_limits;
         let name = queue_name(p, &self.config.context_path);
-        let entries = batch_entries(p, "SendMessageBatch", relaxed).map(|entries| {
+        let entries = batch_entries(p, relaxed).map(|entries| {
             entries
                 .iter()
                 .map(|entry| {
@@ -428,7 +495,19 @@ impl SqsService {
                         prepare_send(entry, tracing.clone(), relaxed),
                     )
                 })
-                .collect()
+                .collect::<Vec<(Value, PreparedSend)>>()
+        });
+        // As upstream, the whole batch is held to the SQS message size limit,
+        // whatever the queue's own MaximumMessageSize.
+        let entries = entries.and_then(|entries| {
+            let total: u64 = entries.iter().map(|(_, entry)| entry.size).sum();
+            if !relaxed && total > u64::from(STRICT_MAXIMUM_MESSAGE_SIZE) {
+                return Err(ApiError::new(
+                    "AWS.SimpleQueueService.BatchRequestTooLong",
+                    "Batch requests cannot be longer than the maximum allowed message size.",
+                ));
+            }
+            Ok(entries)
         });
         PreparedBatch { name, entries }
     }
@@ -460,8 +539,17 @@ impl SqsService {
         prepared: PreparedSend,
         now: Timestamp,
     ) -> ApiResult<Sent> {
-        let fifo = manager.queue(name)?.fifo;
+        let queue = manager.queue(name)?;
+        let fifo = queue.fifo;
+        let maximum_size = self.maximum_message_size(queue);
         let (body, attributes) = prepared.content?;
+        if let Some(maximum) = maximum_size
+            && prepared.size > u64::from(maximum)
+        {
+            return Err(ApiError::invalid(format!(
+                "One or more parameters are invalid. Reason: Message must be shorter than {maximum} bytes."
+            )));
+        }
         let (group_id, deduplication_id) = prepared.ids?;
         if fifo && group_id.is_none() {
             return Err(ApiError::new(
@@ -549,20 +637,22 @@ impl SqsService {
                     self.wait_limit(),
                 )?;
                 request.dead_letter_queue = redrive(attributes.get("RedrivePolicy"), manager)?;
+                request.message_retention_seconds = self.retention_attribute(&attributes)?;
+                request.maximum_message_size = self.maximum_size_attribute(&attributes)?;
                 request.tags = string_map(p.get("tags").or_else(|| p.get("Tags")))?;
                 for key in attributes.keys() {
                     validate_queue_attribute(key, true)?;
                 }
                 let queue = manager.create_queue(request, now)?;
-                Ok(json!({"QueueUrl": self.config.queue_url(&queue.name)}))
+                Ok(json!({"QueueUrl": self.queue_url(&queue.name)}))
             }
             "ListQueues" => Ok(
-                json!({"QueueUrls": manager.list_queues(optional(p, "QueueNamePrefix")?).iter().map(|name| self.config.queue_url(name)).collect::<Vec<_>>()}),
+                json!({"QueueUrls": manager.list_queues(optional(p, "QueueNamePrefix")?).iter().map(|name| self.queue_url(name)).collect::<Vec<_>>()}),
             ),
             "GetQueueUrl" => {
                 let name = required(p, "QueueName")?;
                 manager.queue(name)?;
-                Ok(json!({"QueueUrl": self.config.queue_url(name)}))
+                Ok(json!({"QueueUrl": self.queue_url(name)}))
             }
             "AddPermission" | "RemovePermission" => Ok(json!({})),
             "SendMessageBatch" => {
@@ -573,7 +663,7 @@ impl SqsService {
             "DeleteMessageBatch" | "ChangeMessageVisibilityBatch" => {
                 let name = queue_name(p, &self.config.context_path)?;
                 manager.queue(&name)?;
-                let entries = batch_entries(p, action, self.config.relaxed_limits)?;
+                let entries = batch_entries(p, self.config.relaxed_limits)?;
                 let mut successful = Vec::new();
                 let mut failed = Vec::new();
                 for entry in entries {
@@ -650,6 +740,13 @@ impl SqsService {
                         stats.delayed.to_string(),
                     ),
                 ]);
+                // Under relaxed limits, an attribute the queue doesn't set is omitted.
+                if let Some(seconds) = manager.message_retention_seconds(config) {
+                    values.insert("MessageRetentionPeriod", seconds.to_string());
+                }
+                if let Some(bytes) = self.maximum_message_size(config) {
+                    values.insert("MaximumMessageSize", bytes.to_string());
+                }
                 if config.fifo {
                     values.insert("FifoQueue", "true".into());
                     values.insert(
@@ -694,6 +791,12 @@ impl SqsService {
                 if attributes.contains_key("RedrivePolicy") {
                     config.dead_letter_queue = redrive(attributes.get("RedrivePolicy"), manager)?;
                 }
+                if let Some(seconds) = self.retention_attribute(&attributes)? {
+                    config.message_retention_seconds = Some(seconds);
+                }
+                if let Some(bytes) = self.maximum_size_attribute(&attributes)? {
+                    config.maximum_message_size = Some(bytes);
+                }
                 manager.update_queue(config)?;
                 Ok(json!({}))
             }
@@ -718,7 +821,7 @@ impl SqsService {
                 let name = queue_name(p, &self.config.context_path)?;
                 manager.queue(&name)?;
                 Ok(
-                    json!({"queueUrls":manager.dead_letter_sources(&name).iter().map(|name| self.config.queue_url(name)).collect::<Vec<_>>()}),
+                    json!({"queueUrls":manager.dead_letter_sources(&name).iter().map(|name| self.queue_url(name)).collect::<Vec<_>>()}),
                 )
             }
             "StartMessageMoveTask" => {
@@ -917,9 +1020,10 @@ impl SqsService {
                     name == "All"
                         || name == ".*"
                         || name == *key
+                        // `prefix.*` matches names starting with `prefix.`
                         || name
-                            .strip_suffix(".*")
-                            .is_some_and(|prefix| key.starts_with(prefix))
+                            .strip_suffix('*')
+                            .is_some_and(|prefix| prefix.ends_with('.') && key.starts_with(prefix))
                 })
             })
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -1088,6 +1192,12 @@ async fn metrics(State(service): State<SqsService>) -> Response {
             per_queue(&|_, activity| Some(activity.deleted.to_string())),
         ),
         (
+            "rusticmq_messages_expired_total",
+            "counter",
+            "Messages deleted for exceeding the queue's retention period",
+            per_queue(&|_, activity| Some(activity.expired.to_string())),
+        ),
+        (
             "rusticmq_queue_last_send_timestamp_seconds",
             "gauge",
             "Time of the last send to the queue, stored or deduplicated",
@@ -1211,21 +1321,16 @@ async fn handle(State(mut service): State<SqsService>, request: Request) -> Resp
         ),
     };
     if service.config.wildcard_queue_urls {
+        // The request's host and port, followed by the configured context path.
+        // The request path is ignored: requests may target the root or a queue.
         let protocol = uri.scheme_str().unwrap_or("http");
         let authority = uri
             .authority()
             .map(|value| value.as_str())
             .or_else(|| headers.get("host").and_then(|value| value.to_str().ok()))
             .unwrap_or("localhost");
-        let postfix = if service.config.account_id.is_empty() {
-            "queue"
-        } else {
-            &service.config.account_id
-        };
-        let path = uri.path().trim_end_matches('/');
-        let suffix = format!("/{postfix}");
-        let path = path.strip_suffix(&suffix).unwrap_or(path);
-        Arc::make_mut(&mut service.config).base_url = format!("{protocol}://{authority}{path}");
+        service.request_base_url =
+            Some(format!("{protocol}://{authority}{}", service.config.context_path).into());
     }
     let parsed = if let Some(error) = rejected {
         Err(error)
@@ -1355,7 +1460,7 @@ pub fn now() -> Timestamp {
 }
 
 /// Validate a batch request's entries; these checks do not depend on the queue.
-fn batch_entries<'a>(p: &'a Value, action: &str, relaxed: bool) -> ApiResult<&'a Vec<Value>> {
+fn batch_entries(p: &Value, relaxed: bool) -> ApiResult<&Vec<Value>> {
     let entries = p
         .get("Entries")
         .and_then(Value::as_array)
@@ -1393,18 +1498,6 @@ fn batch_entries<'a>(p: &'a Value, action: &str, relaxed: bool) -> ApiResult<&'a
             ));
         }
     }
-    if action == "SendMessageBatch" && !relaxed {
-        let mut length = 0usize;
-        for entry in entries {
-            length = length.saturating_add(required(entry, "MessageBody")?.encode_utf16().count());
-        }
-        if length > 1024 * 1024 {
-            return Err(ApiError::new(
-                "InvalidAttributeValue",
-                "Batch message bodies exceed the maximum length",
-            ));
-        }
-    }
     Ok(entries)
 }
 
@@ -1419,6 +1512,28 @@ struct PreparedSend {
     tracing: ApiResult<Option<String>>,
     body_digest: String,
     attribute_digest: Option<String>,
+    /// The message size in bytes as SQS counts it, for the queue's limit.
+    size: u64,
+}
+
+/// SQS's message size limit, and its default `MaximumMessageSize`.
+const STRICT_MAXIMUM_MESSAGE_SIZE: u32 = 1024 * 1024;
+
+/// The size of a message as SQS counts it: the body, plus each attribute's
+/// name, data type and value, in UTF-8 bytes.
+fn message_size(body: &str, attributes: &Attributes) -> u64 {
+    let attributes: usize = attributes
+        .iter()
+        .map(|(name, attribute)| {
+            name.len()
+                + attribute.data_type().len()
+                + match &attribute.value {
+                    AttributeValue::String(text) | AttributeValue::Number(text) => text.len(),
+                    AttributeValue::Binary(bytes) => bytes.len(),
+                }
+        })
+        .sum();
+    (body.len() + attributes) as u64
 }
 
 fn prepare_send(p: &Value, tracing: Option<String>, relaxed: bool) -> PreparedSend {
@@ -1468,6 +1583,12 @@ fn prepare_send(p: &Value, tracing: Option<String>, relaxed: bool) -> PreparedSe
                 None => Ok(tracing),
             }
         });
+    let size = match &content {
+        Ok((body, attributes)) => message_size(body, attributes),
+        Err(_) => p["MessageBody"]
+            .as_str()
+            .map_or(0, |body| body.len() as u64),
+    };
     let (body_digest, attribute_digest) = match &content {
         Ok((body, attributes)) => (
             digest::body_digest(body),
@@ -1482,6 +1603,7 @@ fn prepare_send(p: &Value, tracing: Option<String>, relaxed: bool) -> PreparedSe
         tracing,
         body_digest,
         attribute_digest,
+        size,
     }
 }
 
@@ -1645,6 +1767,32 @@ fn boolean(attributes: &BTreeMap<String, String>, name: &str) -> ApiResult<Optio
         })
         .transpose()
 }
+/// A positive integer attribute, within `range` when given and at most `max`.
+fn positive_attribute(
+    attributes: &BTreeMap<String, String>,
+    name: &str,
+    range: Option<std::ops::RangeInclusive<u64>>,
+    max: u64,
+) -> ApiResult<Option<u64>> {
+    attributes
+        .get(name)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|number| {
+                    (1..=max).contains(number)
+                        && range.as_ref().is_none_or(|range| range.contains(number))
+                })
+                .ok_or_else(|| {
+                    ApiError::new(
+                        "InvalidAttributeValue",
+                        format!("Invalid value for the parameter {name}: {value}."),
+                    )
+                })
+        })
+        .transpose()
+}
 fn seconds_attribute(
     attributes: &BTreeMap<String, String>,
     name: &str,
@@ -1756,8 +1904,6 @@ fn validate_text(text: &str, relaxed: bool) -> ApiResult<()> {
         |c| matches!(c as u32, 9 | 10 | 13 | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff),
     ) {
         Some("InvalidMessageContents")
-    } else if text.encode_utf16().count() > 1024 * 1024 {
-        Some("MessageTooLong")
     } else {
         None
     };

@@ -55,6 +55,13 @@ async fn auto_created_queues_use_template_routes_tags_and_fifo_defaults() {
     .await;
     assert_eq!(attributes["Attributes"]["VisibilityTimeout"], "2");
     assert_eq!(attributes["Attributes"]["FifoQueue"], "true");
+    // Created now, not at the template's own creation time (1970 here).
+    let created: i64 = attributes["Attributes"]["CreatedTimestamp"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(created > 1_000_000_000, "{created}");
     assert_eq!(
         ok(&app, "ListQueueTags", json!({"QueueUrl":url})).await["Tags"]["team"],
         "rust"
@@ -233,7 +240,7 @@ async fn an_oversized_batch_fails_before_any_message_is_sent() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(value["__type"], "com.amazonaws.sqs#InvalidAttributeValue");
+    assert_eq!(value["__type"], "com.amazonaws.sqs#BatchRequestTooLong");
     assert_eq!(
         ok(&app, "ReceiveMessage", json!({"QueueUrl":url})).await["Messages"],
         json!([])
@@ -545,6 +552,49 @@ async fn binary_attributes_accept_upstream_signed_byte_arrays() {
         sent["MD5OfMessageAttributes"]
     );
     assert_eq!(call(&app, "SendMessage", json!({"QueueUrl":url,"MessageBody":"bad", "MessageAttributes":{"bad":{"DataType":"Binary","BinaryValue":[128]}}})).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn message_attribute_names_match_exactly_or_by_dotted_prefix() {
+    let app = app();
+    let url = create(&app, "attribute-names").await;
+    let attributes: serde_json::Map<String, Value> =
+        ["foo", "foo.bar", "foo.baz", "fo", "o", "foobar"]
+            .into_iter()
+            .map(|name| (name.into(), json!({"DataType":"String","StringValue":name})))
+            .collect();
+    ok(
+        &app,
+        "SendMessage",
+        json!({"QueueUrl":url,"MessageBody":"m","MessageAttributes":attributes}),
+    )
+    .await;
+    let names = |requested: Value| {
+        let app = app.clone();
+        let url = url.clone();
+        async move {
+            let received = ok(
+                &app,
+                "ReceiveMessage",
+                json!({"QueueUrl":url,"MessageAttributeNames":requested}),
+            )
+            .await;
+            let message = &received["Messages"][0];
+            ok(
+                &app,
+                "ChangeMessageVisibility",
+                json!({"QueueUrl":url,"ReceiptHandle":message["ReceiptHandle"],"VisibilityTimeout":0}),
+            )
+            .await;
+            message["MessageAttributes"]
+                .as_object()
+                .map(|attributes| attributes.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        }
+    };
+    assert_eq!(names(json!(["foo"])).await, ["foo"]);
+    assert_eq!(names(json!(["foo.*"])).await, ["foo.bar", "foo.baz"]);
+    assert_eq!(names(json!([".*"])).await.len(), 6);
 }
 
 async fn call(app: &Router, action: &str, payload: Value) -> (StatusCode, Value) {
@@ -1145,8 +1195,9 @@ async fn move_worker_recovers_when_initial_persistence_fails() {
     manager
         .create_queue(CreateQueue::named("target"), 0)
         .unwrap();
+    // Sent now: strict limits expire messages after four days.
     manager
-        .send_message("source", SendMessage::body("recover"), 0)
+        .send_message("source", SendMessage::body("recover"), rusticmq::sqs::now())
         .unwrap();
     let service = SqsService::new(manager, ServerConfig::default()).with_persistence(store);
     let app = service.clone().router();
@@ -1372,4 +1423,227 @@ async fn a_failed_group_commit_fails_its_requests_and_is_retried_in_order() {
         .restore(vec![], 0)
         .unwrap();
     assert_eq!(restored.messages("jobs").unwrap().len(), 21);
+}
+
+fn relaxed_app() -> Router {
+    SqsService::new(
+        QueueManager::new(),
+        ServerConfig {
+            relaxed_limits: true,
+            ..Default::default()
+        },
+    )
+    .router()
+}
+
+async fn queue_attributes(app: &Router, url: &str) -> Value {
+    ok(
+        app,
+        "GetQueueAttributes",
+        json!({"QueueUrl":url,"AttributeNames":["All"]}),
+    )
+    .await["Attributes"]
+        .clone()
+}
+
+#[tokio::test]
+async fn retention_and_maximum_size_follow_the_limits_mode() {
+    let app = app();
+    let url = create(&app, "defaults").await;
+    let attributes = queue_attributes(&app, &url).await;
+    assert_eq!(attributes["MessageRetentionPeriod"], "345600");
+    assert_eq!(attributes["MaximumMessageSize"], "1048576");
+    let url = ok(
+        &app,
+        "CreateQueue",
+        json!({"QueueName":"set","Attributes":{"MessageRetentionPeriod":"120","MaximumMessageSize":"2048"}}),
+    )
+    .await["QueueUrl"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ok(
+        &app,
+        "SetQueueAttributes",
+        json!({"QueueUrl":url,"Attributes":{"MessageRetentionPeriod":"1209600","MaximumMessageSize":"1024"}}),
+    )
+    .await;
+    let attributes = queue_attributes(&app, &url).await;
+    assert_eq!(attributes["MessageRetentionPeriod"], "1209600");
+    assert_eq!(attributes["MaximumMessageSize"], "1024");
+    for (name, value) in [
+        ("MessageRetentionPeriod", "59"),
+        ("MessageRetentionPeriod", "1209601"),
+        ("MaximumMessageSize", "1023"),
+        ("MaximumMessageSize", "1048577"),
+        ("MaximumMessageSize", "x"),
+    ] {
+        let (status, error) = call(
+            &app,
+            "CreateQueue",
+            json!({"QueueName":"invalid","Attributes":{name:value}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["__type"], "com.amazonaws.sqs#InvalidAttributeValue");
+        assert_eq!(
+            error["Message"],
+            format!("Invalid value for the parameter {name}: {value}.")
+        );
+    }
+
+    let relaxed = relaxed_app();
+    let url = create(&relaxed, "unset").await;
+    let attributes = queue_attributes(&relaxed, &url).await;
+    assert!(attributes.get("MessageRetentionPeriod").is_none());
+    assert!(attributes.get("MaximumMessageSize").is_none());
+    ok(
+        &relaxed,
+        "SetQueueAttributes",
+        json!({"QueueUrl":url,"Attributes":{"MessageRetentionPeriod":"1","MaximumMessageSize":"10"}}),
+    )
+    .await;
+    let attributes = queue_attributes(&relaxed, &url).await;
+    assert_eq!(attributes["MessageRetentionPeriod"], "1");
+    assert_eq!(attributes["MaximumMessageSize"], "10");
+}
+
+#[tokio::test]
+async fn message_size_counts_utf8_bytes_of_the_body_and_attributes() {
+    let app = app();
+    let url = ok(
+        &app,
+        "CreateQueue",
+        json!({"QueueName":"small","Attributes":{"MaximumMessageSize":"1024"}}),
+    )
+    .await["QueueUrl"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // "a" + "String" + ten bytes
+    let attributes = json!({"a":{"DataType":"String","StringValue":"x".repeat(10)}});
+    let send = |body: String, attributes: Option<&Value>| {
+        let mut request = json!({"QueueUrl":url,"MessageBody":body});
+        if let Some(attributes) = attributes {
+            request["MessageAttributes"] = attributes.clone();
+        }
+        call(&app, "SendMessage", request)
+    };
+    for (body, attributes, accepted) in [
+        ("x".repeat(1024), None, true),
+        ("é".repeat(512), None, true),
+        ("x".repeat(1024 - 17), Some(&attributes), true),
+        ("x".repeat(1025), None, false),
+        ("é".repeat(513), None, false),
+        ("x".repeat(1024 - 16), Some(&attributes), false),
+    ] {
+        let (status, value) = send(body, attributes).await;
+        if accepted {
+            assert_eq!(status, StatusCode::OK, "{value}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(value["__type"], "com.amazonaws.sqs#InvalidParameterValue");
+            assert_eq!(
+                value["Message"],
+                "One or more parameters are invalid. Reason: Message must be shorter than 1024 bytes."
+            );
+        }
+    }
+    let default = create(&app, "default-size").await;
+    let (_, value) = call(
+        &app,
+        "SendMessage",
+        json!({"QueueUrl":default,"MessageBody":"x".repeat(1024 * 1024 + 1)}),
+    )
+    .await;
+    assert_eq!(
+        value["Message"],
+        "One or more parameters are invalid. Reason: Message must be shorter than 1048576 bytes."
+    );
+    let relaxed = relaxed_app();
+    let url = create(&relaxed, "any-size").await;
+    ok(
+        &relaxed,
+        "SendMessage",
+        json!({"QueueUrl":url,"MessageBody":"x".repeat(2 * 1024 * 1024)}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_periodic_sweep_deletes_expired_messages() {
+    let app = relaxed_app();
+    let url = ok(
+        &app,
+        "CreateQueue",
+        json!({"QueueName":"short","Attributes":{"MessageRetentionPeriod":"1"}}),
+    )
+    .await["QueueUrl"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ok(
+        &app,
+        "SendMessage",
+        json!({"QueueUrl":url,"MessageBody":"soon gone"}),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let metrics = scrape(&app).await;
+    assert!(
+        metrics.contains("rusticmq_messages_expired_total{queue=\"short\"} 1"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("rusticmq_messages_visible{queue=\"short\"} 0"));
+}
+
+#[tokio::test]
+async fn wildcard_urls_ignore_the_request_path() {
+    let app = SqsService::new(
+        QueueManager::new(),
+        ServerConfig {
+            wildcard_queue_urls: true,
+            ..Default::default()
+        },
+    )
+    .router();
+    let send = |path: &'static str, action: &'static str, payload: Value| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("host", "elasticmq:9324")
+                        .header("x-amz-target", format!("AmazonSQS.{action}"))
+                        .header("content-type", "application/x-amz-json-1.0")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<Value>(&body).unwrap()
+        }
+    };
+    let dlq = send("/", "CreateQueue", json!({"QueueName":"dlq"})).await;
+    assert_eq!(dlq["QueueUrl"], "http://elasticmq:9324/000000000000/dlq");
+    send(
+        "/",
+        "CreateQueue",
+        json!({"QueueName":"source","Attributes":{"RedrivePolicy":json!({"deadLetterTargetArn":"arn:aws:sqs:elasticmq:000000000000:dlq","maxReceiveCount":1}).to_string()}}),
+    )
+    .await;
+    // SDK v1 sends this action to the queue URL itself.
+    let sources = send(
+        "/000000000000/dlq",
+        "ListDeadLetterSourceQueues",
+        json!({"QueueUrl":"http://elasticmq:9324/000000000000/dlq"}),
+    )
+    .await;
+    assert_eq!(
+        sources["queueUrls"],
+        json!(["http://elasticmq:9324/000000000000/source"])
+    );
 }
