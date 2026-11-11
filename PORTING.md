@@ -108,6 +108,24 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
+## 0.5.1 Docker publication
+
+The images from release commit `8c8ccd3` are published to
+`localhost:5555/igorski89/rusticmq:latest`, `:0.5.1` and `:8c8ccd3`. All three
+tags point to the same AMD64/ARM64 manifest index:
+
+```text
+sha256:a3e42db8c4ed154813456f6a7a7a9ee7e9e613e5bea058fcfde5d335debe6272
+```
+
+0.5.1 updates rusqlite to 0.39, which bundles SQLite 3.51.3 instead of 3.51.1.
+SQLite 3.51.0 and 3.51.1 can deadlock every connection in a process when the
+last WAL connection to a file closes while another thread opens it. 3.51.3 also
+fixes a WAL-reset corruption bug. The storage format is unchanged. The full
+Docker audit passed 255 tests on ARM64 locally, with 77 Rust tests, and CI run
+43009962678 passed it on native AMD64 and ARM64 runners. Both published architectures
+passed a smoke test, and the published binary contains SQLite 3.51.3.
+
 ## 0.5.0 Docker publication
 
 The images from release commit `60dd354` are published to
