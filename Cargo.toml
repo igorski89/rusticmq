@@ -10,7 +10,7 @@ axum = "0.8"
 base64 = "0.22"
 bigdecimal = "0.4"
 hocon = { version = "0.9", path = "vendor/hocon" }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 md-5 = "0.10"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
