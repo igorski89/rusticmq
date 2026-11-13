@@ -272,21 +272,23 @@ suites and stops the server. CI runs these suites as well.
 ## Performance
 
 Compared with ElasticMQ 1.7.1 as `linux/arm64` containers under the same limits,
-RusticMQ 0.5.0 ties the ElasticMQ JVM build on durable concurrent sends and is 1.7
-times as fast as native. It receives 2.5 times as fast as the JVM build, and is the
-only one that lost no acknowledged message when killed. In memory mode it ties
-ElasticMQ native under concurrent load, and the JVM build is about twice as fast at
-concurrent sends. These are medians on one laptop's Docker VM:
+RusticMQ 0.7.0 ties the ElasticMQ JVM build on in-memory receives and holds 1,000
+long polls in 4 MiB. The ElasticMQ JVM build still sends about 1.5 times as
+fast at 64 connections. On durable queues RusticMQ ties the JVM build on concurrent
+sends, receives 3.0 times as fast, and is the only one that lost no acknowledged
+message when killed. These are medians on one laptop's Docker VM:
 
 | | RusticMQ | ElasticMQ native | ElasticMQ JVM |
 | --- | --- | --- | --- |
-| Send, 64 connections, durable (msg/s) | 28,662 | 16,739 | 30,816 |
-| Receive and delete, 64 connections, durable (msg/s) | 45,674 | 10,077 | 18,091 |
-| Send, 64 connections, in memory (msg/s) | 25,765 | 27,948 | 53,488 |
-| Send, 1 connection, in memory (msg/s) | 6,151 | 2,893 | 3,721 |
-| Startup (ms) | 61 | 97 | 1,048 |
-| Idle process memory (MiB) | 0.3 | 14.8 | 150 |
-| Acknowledged sends lost after `SIGKILL`, three rounds | 0, 0, 0 | 5,230, 2,058, 2,300 | 2,854, 2,645, 2,686 |
+| Send, 64 connections, in memory (msg/s) | 37,037 | 30,878 | 54,515 |
+| Receive and delete, 64 connections, in memory (msg/s) | 75,854 | 58,197 | 73,449 |
+| Send, 1 connection, in memory (msg/s) | 13,412 | 3,072 | 3,705 |
+| Send, 64 connections, durable (msg/s) | 33,339 | 17,932 | 34,135 |
+| Receive and delete, 64 connections, durable (msg/s) | 56,154 | 10,334 | 18,821 |
+| Startup (ms) | 55 | 92 | 1,084 |
+| Idle process memory (MiB) | 0.17 | 14.8 | 152 |
+| Memory with 1,000 long polls, in memory (MiB) | 3.9 | 676 | 1,242 |
+| Acknowledged sends lost after `SIGKILL`, three rounds | 0, 0, 0 | 1,320, 2,606, 2,195 | 2,581, 2,288, 2,925 |
 
 See [BENCHMARKS.md](BENCHMARKS.md) for the method, all results and their limits.
 
