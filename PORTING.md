@@ -126,6 +126,23 @@ contracts and tested scenarios, rather than promising every possible input or
 operating environment. Run commands are in `README.md` and
 `integration/upstream/README.md`.
 
+## 0.7.0 Docker publication
+
+The images from release commit `c3611ce` are published to
+`localhost:5555/igorski89/rusticmq:latest`, `:0.7.0` and `:c3611ce`. All three
+tags point to the same AMD64/ARM64 manifest index:
+
+```text
+sha256:8d54e4968aa4ebb86bf8614944aab6768edc83cb267925816ca658286c356d97
+```
+
+0.7.0 keeps messages in the engine alone when no database is configured, instead of
+in an in-memory SQLite database; `--data-dir :memory:` selects in-memory SQLite. The
+full Docker audit passed 286 tests on ARM64 locally, with 94 Rust tests and the
+original 2.0 suites (164 Java SDK and five Node.js tests), and CI run 43460523817
+passed it on native AMD64 and ARM64 runners. Both published architectures passed a
+smoke test.
+
 ## 0.6.0 Docker publication
 
 The images from release commit `c4c4395` are published to
