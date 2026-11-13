@@ -66,9 +66,9 @@ def rusticmq(image, memory_args=()):
 
 
 SERVERS = {
-    "rusticmq": rusticmq("localhost:5555/igorski89/rusticmq:0.6.0"),
+    "rusticmq": rusticmq("localhost:5555/igorski89/rusticmq:0.7.0"),
     # Not run by default: the SQLite write path without disk I/O.
-    "rusticmq-sqlite-memory": rusticmq("localhost:5555/igorski89/rusticmq:0.6.0", ["--data-dir", ":memory:"]),
+    "rusticmq-sqlite-memory": rusticmq("localhost:5555/igorski89/rusticmq:0.7.0", ["--data-dir", ":memory:"]),
     "elasticmq-native": elastic("softwaremill/elasticmq-native:1.7.1"),
     "elasticmq-jvm": elastic("softwaremill/elasticmq:1.7.1"),
 }
