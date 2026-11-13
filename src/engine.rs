@@ -226,6 +226,40 @@ impl Queue {
     }
 }
 
+/// Ordered mutation events for persistence, and whether anything changed.
+#[derive(Debug, Default)]
+struct EventLog {
+    events: Vec<QueueEvent>,
+    /// Message events are built only when this is false, which saves cloning
+    /// every message touched when no database reads them.
+    discard_messages: bool,
+    changed: bool,
+}
+
+impl EventLog {
+    fn queue(&mut self, event: QueueEvent) {
+        self.changed = true;
+        self.events.push(event);
+    }
+
+    fn message(&mut self, event: impl FnOnce() -> QueueEvent) {
+        self.changed = true;
+        if !self.discard_messages {
+            self.events.push(event());
+        }
+    }
+
+    fn messages(&mut self, events: impl ExactSizeIterator<Item = QueueEvent>) {
+        if events.len() == 0 {
+            return;
+        }
+        self.changed = true;
+        if !self.discard_messages {
+            self.events.extend(events);
+        }
+    }
+}
+
 /// Synchronous queue engine. Serialize access in the embedding application.
 /// All times are epoch milliseconds; operations never block or sleep.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -236,7 +270,7 @@ pub struct QueueManager {
     next_order: u64,
     next_sequence: u64,
     #[serde(skip)]
-    events: Vec<QueueEvent>,
+    events: EventLog,
     #[serde(skip)]
     move_tasks: BTreeMap<String, QueueRef>,
 }
@@ -296,7 +330,7 @@ impl QueueManager {
                 oldest_created: Some(Timestamp::MAX),
             },
         );
-        self.events.push(QueueEvent::QueueCreated(config.clone()));
+        self.events.queue(QueueEvent::QueueCreated(config.clone()));
         Ok(config)
     }
 
@@ -315,7 +349,7 @@ impl QueueManager {
     pub fn delete_queue(&mut self, name: &str) {
         self.queues.remove(name);
         self.move_tasks.retain(|_, source| source.name != name);
-        self.events.push(QueueEvent::QueueDeleted(name.into()));
+        self.events.queue(QueueEvent::QueueDeleted(name.into()));
     }
 
     pub fn purge_queue(&mut self, name: &str) -> Result<(), Error> {
@@ -326,7 +360,7 @@ impl QueueManager {
         queue.oldest_created = Some(Timestamp::MAX);
         queue.deduplication.clear();
         self.events
-            .extend(ids.into_iter().map(|id| QueueEvent::MessageRemoved {
+            .messages(ids.into_iter().map(|id| QueueEvent::MessageRemoved {
                 queue: name.into(),
                 id,
             }));
@@ -355,7 +389,7 @@ impl QueueManager {
         }
         queue.dead_letters = dead_letters;
         queue.config = config.clone();
-        self.events.push(QueueEvent::QueueMetadataUpdated(config));
+        self.events.queue(QueueEvent::QueueMetadataUpdated(config));
         Ok(())
     }
 
@@ -406,7 +440,7 @@ impl QueueManager {
         let queue = self.get_mut(name)?;
         queue.config.tags.extend(tags);
         let config = queue.config.clone();
-        self.events.push(QueueEvent::QueueMetadataUpdated(config));
+        self.events.queue(QueueEvent::QueueMetadataUpdated(config));
         Ok(())
     }
 
@@ -416,7 +450,7 @@ impl QueueManager {
             queue.config.tags.remove(key);
         }
         let config = queue.config.clone();
-        self.events.push(QueueEvent::QueueMetadataUpdated(config));
+        self.events.queue(QueueEvent::QueueMetadataUpdated(config));
         Ok(())
     }
 
@@ -587,7 +621,7 @@ impl QueueManager {
         } else if let Some(index) = &mut queue.delivery {
             index.insert(&message, queue.config.fifo);
         }
-        self.events.push(QueueEvent::MessageAdded {
+        self.events.message(|| QueueEvent::MessageAdded {
             queue: name.into(),
             message,
         });
@@ -657,7 +691,7 @@ impl QueueManager {
                     }
                 }
                 self.get_mut(name)?.remove_message(&id);
-                self.events.push(QueueEvent::MessageRemoved {
+                self.events.message(|| QueueEvent::MessageRemoved {
                     queue: name.into(),
                     id,
                 });
@@ -678,7 +712,7 @@ impl QueueManager {
             let message = message.clone();
             queue.reschedule(previous_delivery, &message);
             queue.refresh_history(&message);
-            self.events.push(QueueEvent::MessageUpdated {
+            self.events.message(|| QueueEvent::MessageUpdated {
                 queue: name.into(),
                 message: message.clone(),
             });
@@ -762,7 +796,7 @@ impl QueueManager {
         queue.refresh_history(&message);
         queue.remove_message(id);
         queue.activity.deleted += 1;
-        self.events.push(QueueEvent::MessageRemoved {
+        self.events.message(|| QueueEvent::MessageRemoved {
             queue: name.into(),
             id: id.into(),
         });
@@ -788,7 +822,7 @@ impl QueueManager {
         let message = message.clone();
         queue.reschedule(previous_delivery, &message);
         queue.refresh_history(&message);
-        self.events.push(QueueEvent::MessageUpdated {
+        self.events.message(|| QueueEvent::MessageUpdated {
             queue: name.into(),
             message,
         });
@@ -856,7 +890,7 @@ impl QueueManager {
         queue.activity.expired += expired.len() as u64;
         let count = expired.len();
         self.events
-            .extend(expired.into_iter().map(|id| QueueEvent::MessageRemoved {
+            .messages(expired.into_iter().map(|id| QueueEvent::MessageRemoved {
                 queue: name.into(),
                 id,
             }));
@@ -987,7 +1021,7 @@ impl QueueManager {
             .expect("task index invariant")
             .data
             .moved += 1;
-        self.events.push(QueueEvent::MessageRemoved {
+        self.events.message(|| QueueEvent::MessageRemoved {
             queue: source.name,
             id: message.id,
         });
@@ -1041,13 +1075,27 @@ impl QueueManager {
 
     /// Drain the ordered mutation events for a persistence or metrics listener.
     pub fn drain_events(&mut self) -> Vec<QueueEvent> {
-        std::mem::take(&mut self.events)
+        std::mem::take(&mut self.events.events)
     }
 
     /// Return failed persistence events to the front of the pending stream.
     pub fn requeue_events(&mut self, mut events: Vec<QueueEvent>) {
-        events.append(&mut self.events);
-        self.events = events;
+        events.append(&mut self.events.events);
+        self.events.events = events;
+        self.events.changed = true;
+    }
+
+    /// Whether anything changed since the last call, for waking long polls.
+    /// Set by every mutation, including those whose events are discarded.
+    pub fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.events.changed)
+    }
+
+    /// Stop building message events (sends, receives, deletes) when nothing
+    /// persists them. Queue events are rare and are always recorded, since a
+    /// queue definitions file needs them.
+    pub fn set_discard_message_events(&mut self, discard: bool) {
+        self.events.discard_messages = discard;
     }
 
     /// Restore definitions in dependency order so bound routes are available
@@ -1081,7 +1129,7 @@ impl QueueManager {
             }
         }
         for config in sorted {
-            let event_count = self.events.len();
+            let event_count = self.events.events.len();
             self.create_queue(
                 CreateQueue {
                     name: config.name.clone(),
@@ -1100,8 +1148,8 @@ impl QueueManager {
                 config.created,
             )?;
             self.get_mut(&config.name)?.config = config.clone();
-            if self.events.len() > event_count
-                && let Some(QueueEvent::QueueCreated(created)) = self.events.last_mut()
+            if self.events.events.len() > event_count
+                && let Some(QueueEvent::QueueCreated(created)) = self.events.events.last_mut()
             {
                 *created = config;
             }

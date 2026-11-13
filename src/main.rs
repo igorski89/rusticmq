@@ -1,7 +1,7 @@
 use rusticmq::{
     config::AppConfig,
     persistence::Persistence,
-    sqs::{SqsService, now},
+    sqs::{SqsService, Storage, now},
 };
 use std::path::PathBuf;
 
@@ -11,20 +11,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut data_dir = std::env::var_os("RUSTICMQ_DATA_DIR").map(PathBuf::from);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--config" => {
-                config_path = Some(PathBuf::from(
-                    args.next().ok_or("--config requires a path")?,
-                ))
-            }
+        // Both `--option value` and `--option=value`.
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value.to_owned())),
+            _ => (arg.as_str(), None),
+        };
+        let mut value = |error: &'static str| inline.clone().or_else(|| args.next()).ok_or(error);
+        match name {
+            "--config" => config_path = Some(PathBuf::from(value("--config requires a path")?)),
             "--data-dir" => {
-                data_dir = Some(PathBuf::from(
-                    args.next()
-                        .ok_or("--data-dir requires a directory or :memory:")?,
-                ))
+                data_dir = Some(PathBuf::from(value(
+                    "--data-dir requires a directory or :memory:",
+                )?))
             }
             "--help" | "-h" => {
-                println!("rusticmq [--config elasticmq.conf] [--data-dir :memory:|DIR]");
+                println!("rusticmq [--config elasticmq.conf] [--data-dir DIR|:memory:]");
                 return Ok(());
             }
             _ => return Err(format!("Unknown argument: {arg}").into()),
@@ -35,10 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         app.message_storage = Some(database_in(dir)?);
     }
     app.service.configured_queues = app.queues.len();
-    app.service.persistent_storage = app
-        .message_storage
-        .as_ref()
-        .is_some_and(|path| path.as_os_str() != ":memory:" && path.as_os_str() != ":memory");
+    app.service.storage = match &app.message_storage {
+        None => Storage::Memory,
+        Some(path) if is_memory(path) => Storage::SqliteMemory,
+        Some(_) => Storage::Sqlite,
+    };
     if let Ok(value) = std::env::var("RUSTICMQ_BIND") {
         app.bind = value;
     }
@@ -61,6 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Persistence::open(app.queue_storage, app.message_storage, app.prune_messages)?;
     let mut manager = persistence.restore_with_limits(app.queues, now(), config.relaxed_limits)?;
     persistence.apply(&manager.drain_events(), &manager)?;
+    // With no database nothing reads message events, so don't build them.
+    manager.set_discard_message_events(!persistence.has_database());
     if !app.enabled {
         shutdown_signal().await;
         return Ok(());
@@ -102,9 +106,14 @@ async fn shutdown_signal() {
 /// SQLite in WAL mode keeps `-wal` and `-shm` files beside the database, so
 /// storage is configured as a directory rather than a single file.
 fn database_in(dir: PathBuf) -> std::io::Result<PathBuf> {
-    if dir.as_os_str() == ":memory:" || dir.as_os_str() == ":memory" {
+    if is_memory(&dir) {
         return Ok(PathBuf::from(":memory:"));
     }
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("rusticmq.sqlite"))
+}
+
+/// SQLite's in-memory database name, also accepted without the final colon.
+fn is_memory(path: &std::path::Path) -> bool {
+    path.as_os_str() == ":memory:" || path.as_os_str() == ":memory"
 }

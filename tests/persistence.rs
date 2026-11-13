@@ -11,9 +11,11 @@ fn flush(store: &Persistence, manager: &mut QueueManager) {
 }
 
 #[test]
-fn sqlite_memory_is_the_default_and_configuration_accepts_file_paths() {
+fn no_database_is_the_default_and_configuration_accepts_file_paths() {
     let config = AppConfig::load(None, 0).unwrap();
-    assert_eq!(config.message_storage.unwrap().to_str(), Some(":memory:"));
+    assert_eq!(config.message_storage, None);
+    let store = Persistence::open(None, config.message_storage, false).unwrap();
+    assert!(!store.has_database() && !store.writes_anything());
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("elasticmq.conf");
     fs::write(
@@ -636,4 +638,22 @@ fn expired_messages_are_deleted_from_sqlite() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn configuration_can_select_in_memory_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("elasticmq.conf");
+    fs::write(
+        &path,
+        r#"messages-storage { enabled = true, uri = "jdbc:sqlite::memory:" }"#,
+    )
+    .unwrap();
+    let config = AppConfig::load(Some(&path), 0).unwrap();
+    assert_eq!(
+        config.message_storage.as_deref().and_then(|p| p.to_str()),
+        Some(":memory:")
+    );
+    let store = Persistence::open(None, config.message_storage, false).unwrap();
+    assert!(store.has_database());
 }

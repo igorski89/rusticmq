@@ -20,8 +20,9 @@ AWS SDK clients can use `http://localhost:9324`, region `elasticmq`, and any loc
 credentials. Returned queue URLs use the host and port the client connected to,
 and account `000000000000`.
 
-Storage uses SQLite in memory by default. Specify a data directory for durable
-queues and messages, including visibility state and receipt handles:
+By default, queues and messages are kept in memory only, with no database, as
+in ElasticMQ. Specify a data directory for durable queues and messages,
+including visibility state and receipt handles:
 
 ```sh
 cargo run -- --data-dir ./data
@@ -30,8 +31,18 @@ cargo run -- --config ./elasticmq.conf --data-dir ./data
 
 RusticMQ creates the directory if needed and keeps `rusticmq.sqlite` in it, with
 the `-wal` and `-shm` files SQLite writes beside it. Mount or back up the whole
-directory, never the database file alone. `--data-dir :memory:` (also `:memory`)
-selects ephemeral storage.
+directory, never the database file alone. `--data-dir :memory:` (also `:memory`,
+or `--data-dir=:memory:`) keeps an in-memory SQLite database instead: nothing
+survives a restart, but every change takes the same SQLite write path as durable
+storage, without disk I/O. In HOCON, `messages-storage { enabled = true, uri =
+"jdbc:sqlite::memory:" }` does the same, and `enabled = false`, the default,
+means no database.
+
+| Mode | Command line | HOCON `messages-storage` | `/metrics` storage label |
+| --- | --- | --- | --- |
+| Memory, no database (default) | no `--data-dir` | `enabled = false` | `memory` |
+| In-memory SQLite | `--data-dir :memory:` | `uri = "jdbc:sqlite::memory:"` | `sqlite-memory` |
+| Durable SQLite | `--data-dir DIR` | `uri = "jdbc:sqlite:PATH"` | `sqlite` |
 
 Data directories from earlier versions open in 0.5.0 unchanged. Since 0.5.0,
 receives and visibility changes are stored in a separate table that 0.4.x and
@@ -40,6 +51,15 @@ that were in flight visible again and restarts their receive counts. Upgrading
 again afterwards can keep messages that the older version received hidden until
 an earlier visibility timeout expires, and their receipt handles stop working.
 No message is lost either way.
+
+### Upgrading to 0.7.0
+
+Without `--data-dir` or `messages-storage`, messages are now kept in the engine
+alone instead of in an in-memory SQLite database. Nothing persisted before
+either, so the only visible change is speed and memory use. `--data-dir
+:memory:` keeps the previous behaviour. The `rusticmq_config_info` storage label
+is `memory`, `sqlite-memory` or `sqlite`; in-memory SQLite was reported as
+`memory` before.
 
 ### Upgrading to 0.6.0
 
@@ -112,7 +132,7 @@ environment variables override the corresponding HOCON settings.
 | Option | Environment variable | Default |
 | --- | --- | --- |
 | `--config PATH` | `RUSTICMQ_CONFIG` | No configuration file |
-| `--data-dir DIR` | `RUSTICMQ_DATA_DIR` | `:memory:` |
+| `--data-dir DIR` | `RUSTICMQ_DATA_DIR` | Memory only, no database |
 
 Additional environment variables configure the server:
 

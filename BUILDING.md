@@ -97,7 +97,8 @@ $env:RUSTICMQ_BASE_URL = 'http://localhost:9324'
 ## Run and verify
 
 The default listener is `0.0.0.0:9324`; clients use `http://localhost:9324`.
-Without `--data-dir DIR`, storage is in-memory SQLite (`:memory:`). The data
+Without `--data-dir DIR`, queues and messages are kept in memory with no
+database; `--data-dir :memory:` uses an in-memory SQLite database instead. The data
 directory holds `rusticmq.sqlite` and its `-wal` and `-shm` files; it is created if
 missing and must be writable. Stop the native server
 with Ctrl+C.

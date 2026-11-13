@@ -5,8 +5,9 @@ one dependency update) from https://github.com/softwaremill/elasticmq. Until 0.5
 the reference was 1.x commit `b2abbc62954851b5244211fba75c3ac83fb6e0b2`.
 
 The requested backend is implemented. The Web UI is excluded by instruction.
-SQLite replaces the JVM database format; storage defaults to `:memory:` and a
-file path enables durable queues and messages. H2 file compatibility is excluded.
+SQLite replaces the JVM database format. As in ElasticMQ, storage defaults to
+memory with no database; a file path enables durable queues and messages, and
+`:memory:` selects an in-memory SQLite database. H2 file compatibility is excluded.
 
 ## Requirements and verification
 

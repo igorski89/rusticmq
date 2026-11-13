@@ -71,6 +71,17 @@ impl Persistence {
         })
     }
 
+    /// Whether messages are stored in SQLite, on disk or in memory.
+    pub fn has_database(&self) -> bool {
+        self.connection.is_some()
+    }
+
+    /// Whether anything is persisted at all: a database or a queue
+    /// definitions file.
+    pub fn writes_anything(&self) -> bool {
+        self.connection.is_some() || self.definitions_path.is_some()
+    }
+
     pub fn restore(
         &self,
         base: Vec<QueueConfig>,

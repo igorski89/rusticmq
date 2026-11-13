@@ -54,16 +54,26 @@ def elastic(image):
     return {"image": image, "options": options, "args": lambda storage: []}
 
 
-SERVERS = {
-    "rusticmq": {
-        "image": "localhost:5555/igorski89/rusticmq:0.5.0",
+def rusticmq(image, memory_args=()):
+    """`memory_args` select the in-memory store: none for the default, or
+    `--data-dir :memory:` for in-memory SQLite."""
+    return {
+        "image": image,
         "options": lambda storage: ["--mount", f"type=bind,source={CONF}/rusticmq.conf,target=/opt/bench.conf,readonly"],
-        "args": lambda storage: ["--config", "/opt/bench.conf"] + (["--data-dir", "/data"] if storage == "durable" else []),
-    },
+        "args": lambda storage: ["--config", "/opt/bench.conf"]
+        + (["--data-dir", "/data"] if storage == "durable" else list(memory_args)),
+    }
+
+
+SERVERS = {
+    "rusticmq": rusticmq("localhost:5555/igorski89/rusticmq:0.6.0"),
+    # Not run by default: the SQLite write path without disk I/O.
+    "rusticmq-sqlite-memory": rusticmq("localhost:5555/igorski89/rusticmq:0.6.0", ["--data-dir", ":memory:"]),
     "elasticmq-native": elastic("softwaremill/elasticmq-native:1.7.1"),
     "elasticmq-jvm": elastic("softwaremill/elasticmq:1.7.1"),
 }
 STORAGES = ("memory", "durable")
+DEFAULT_SERVERS = ("rusticmq", "elasticmq-native", "elasticmq-jvm")
 
 
 def docker(*args, check=True, timeout=600):
@@ -386,7 +396,7 @@ def run(options):
             sink(dict(server="", storage="", round=0, phase="environment", platform=PLATFORM, memory=MEMORY,
                 server_cpus=SERVER_CPUS, generator_cpus=GENERATOR_CPUS,
                 images={name: docker("image", "inspect", spec["image"], "--format", "{{.Id}} {{.Architecture}} {{.Size}}")
-                    for name, spec in SERVERS.items()},
+                    for name, spec in SERVERS.items() if name in options.servers.split(",")},
                 docker_cpus=docker("info", "--format", "{{.NCPU}}"), docker_memory=docker("info", "--format", "{{.MemTotal}}"),
                 started=datetime.now().isoformat()))
         for number in range(1, options.rounds + 1):
@@ -520,10 +530,15 @@ def main():
     parser.add_argument("command", choices=["run", "report"])
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--quick", action="store_true", help="Short phases, to check the harness")
-    parser.add_argument("--servers", default=",".join(SERVERS))
+    parser.add_argument("--servers", default=",".join(DEFAULT_SERVERS))
+    parser.add_argument("--image", action="append", default=[], metavar="SERVER=IMAGE",
+                        help="Run SERVER from another image, e.g. a local build; repeatable")
     parser.add_argument("--storages", default=",".join(STORAGES))
     parser.add_argument("--output", default=str(ROOT / "results" / "raw.jsonl"))
     options = parser.parse_args()
+    for override in options.image:
+        server, image = override.split("=", 1)
+        SERVERS[server]["image"] = image
     if shutil.which("docker") is None:
         raise SystemExit("docker is required")
     {"run": run, "report": report}[options.command](options)

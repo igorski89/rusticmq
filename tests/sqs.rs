@@ -269,7 +269,7 @@ async fn metrics_report_traffic_deduplication_and_configuration() {
         ServerConfig {
             config_file: Some("/opt/elasticmq.conf".into()),
             configured_queues: 4,
-            persistent_storage: true,
+            storage: rusticmq::sqs::Storage::Sqlite,
             max_content_length: None,
             ..Default::default()
         },
@@ -1646,4 +1646,71 @@ async fn wildcard_urls_ignore_the_request_path() {
         sources["queueUrls"],
         json!(["http://elasticmq:9324/000000000000/source"])
     );
+}
+
+/// Without a database, message events are never built, so long polls must
+/// wake from the change flag alone.
+#[tokio::test]
+async fn long_poll_wakes_without_a_database() {
+    let mut manager = QueueManager::new();
+    manager.set_discard_message_events(true);
+    let app = SqsService::new(manager, ServerConfig::default())
+        .with_persistence(rusticmq::persistence::Persistence::open(None, None, false).unwrap())
+        .router();
+    let url = create(&app, "q").await;
+    let receive_app = app.clone();
+    let receive_url = url.clone();
+    let waiting = tokio::spawn(async move {
+        ok(
+            &receive_app,
+            "ReceiveMessage",
+            json!({"QueueUrl":receive_url,"WaitTimeSeconds":2}),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    ok(
+        &app,
+        "SendMessage",
+        json!({"QueueUrl":url,"MessageBody":"wake"}),
+    )
+    .await;
+    let response = tokio::time::timeout(std::time::Duration::from_millis(500), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response["Messages"][0]["Body"], "wake");
+}
+
+/// A queue definitions file is still written when messages are kept in
+/// memory only and their events are discarded.
+#[tokio::test]
+async fn the_definitions_file_is_written_without_a_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("queues.conf");
+    let mut manager = QueueManager::new();
+    manager.set_discard_message_events(true);
+    let store = rusticmq::persistence::Persistence::open(Some(path.clone()), None, false).unwrap();
+    assert!(store.writes_anything() && !store.has_database());
+    let app = SqsService::new(manager, ServerConfig::default())
+        .with_persistence(store)
+        .router();
+    let url = create(&app, "kept").await;
+    let written = || rusticmq::config::read_queue_file(&path, 0).unwrap();
+    assert_eq!(written()[0].name, "kept");
+    ok(
+        &app,
+        "SendMessage",
+        json!({"QueueUrl":url,"MessageBody":"m"}),
+    )
+    .await;
+    ok(
+        &app,
+        "SetQueueAttributes",
+        json!({"QueueUrl":url,"Attributes":{"VisibilityTimeout":"7"}}),
+    )
+    .await;
+    assert_eq!(written()[0].visibility_timeout_ms, 7000);
+    ok(&app, "DeleteQueue", json!({"QueueUrl":url})).await;
+    assert!(written().is_empty());
 }

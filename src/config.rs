@@ -69,7 +69,8 @@ impl AppConfig {
                 .ok_or("messages-storage.uri must use sqlite:PATH or jdbc:sqlite:PATH")?;
             Some(PathBuf::from(path))
         } else {
-            Some(PathBuf::from(":memory:"))
+            // Messages stay in the engine only, with no database at all.
+            None
         };
         Ok(Self {
             bind: format!("{bind_host}:{bind_port}"),
@@ -103,7 +104,7 @@ impl AppConfig {
                 )?,
                 config_file: path.map(|path| path.display().to_string()),
                 configured_queues: 0,
-                persistent_storage: false,
+                storage: crate::sqs::Storage::Memory,
             },
             queues: read_queues(&doc, now, &origin, "queues")?,
             queue_storage: if boolean(queues, "enabled", false)? {

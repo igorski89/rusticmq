@@ -993,3 +993,44 @@ fn create_queue_compares_retention_and_maximum_size() {
         Err(Error::QueueAlreadyExists(_))
     ));
 }
+
+#[test]
+fn discarded_message_events_still_mark_changes_and_keep_queue_events() {
+    let mut manager = manager();
+    manager.drain_events();
+    assert!(manager.take_changed());
+    manager.set_discard_message_events(true);
+    manager
+        .send_message("q", SendMessage::body("hello"), 0)
+        .unwrap();
+    assert!(manager.take_changed());
+    assert!(!manager.take_changed());
+    let received = receive(&mut manager, "q", 1, 0).remove(0);
+    assert!(manager.take_changed());
+    manager
+        .delete_message("q", &received.receipt_handle.unwrap())
+        .unwrap();
+    assert!(manager.take_changed());
+    manager.purge_queue("q").unwrap();
+    assert!(
+        !manager.take_changed(),
+        "purging an empty queue changes nothing"
+    );
+    assert!(manager.drain_events().is_empty());
+    manager
+        .create_queue(CreateQueue::named("other"), 0)
+        .unwrap();
+    manager.delete_queue("other");
+    assert!(matches!(
+        manager.drain_events().as_slice(),
+        [QueueEvent::QueueCreated(q), QueueEvent::QueueDeleted(name)] if q.name == "other" && name == "other"
+    ));
+    manager.set_discard_message_events(false);
+    manager
+        .send_message("q", SendMessage::body("kept"), 0)
+        .unwrap();
+    assert!(matches!(
+        manager.drain_events().as_slice(),
+        [QueueEvent::MessageAdded { .. }]
+    ));
+}

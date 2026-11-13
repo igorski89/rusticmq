@@ -32,6 +32,10 @@ use tokio::sync::{Mutex, oneshot, watch};
 
 type ApiResult<T> = Result<T, ApiError>;
 
+/// Receives returning at least this many body bytes yield before building
+/// their response; see `receive`.
+const YIELD_BEFORE_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// A request's commit. Await it after releasing the manager, and before
 /// answering: nothing is acknowledged until its changes are durable.
 #[must_use]
@@ -117,7 +121,29 @@ pub struct ServerConfig {
     /// Startup details reported by `rusticmq_config_info` and `/metrics` gauges.
     pub config_file: Option<String>,
     pub configured_queues: usize,
-    pub persistent_storage: bool,
+    pub storage: Storage,
+}
+
+/// Where messages are kept, reported by `rusticmq_config_info`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Storage {
+    /// In the engine only, with no database, like ElasticMQ's default.
+    #[default]
+    Memory,
+    /// An in-memory SQLite database (`:memory:`): the durable write path
+    /// without disk I/O.
+    SqliteMemory,
+    Sqlite,
+}
+
+impl Storage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::SqliteMemory => "sqlite-memory",
+            Self::Sqlite => "sqlite",
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -133,7 +159,7 @@ impl Default for ServerConfig {
             max_content_length: Some(8 * 1024 * 1024),
             config_file: None,
             configured_queues: 0,
-            persistent_storage: false,
+            storage: Storage::Memory,
         }
     }
 }
@@ -238,8 +264,13 @@ impl SqsService {
         router.layer(limit).with_state(self)
     }
 
+    /// Commit changes through `persistence`. Without a database or a queue
+    /// definitions file there is nothing to write, so no writer is started
+    /// and requests are answered without waiting on one.
     pub fn with_persistence(mut self, persistence: crate::persistence::Persistence) -> Self {
-        self.writer = Some(crate::persistence::Writer::spawn(persistence));
+        if persistence.writes_anything() {
+            self.writer = Some(crate::persistence::Writer::spawn(persistence));
+        }
         self
     }
 
@@ -385,8 +416,8 @@ impl SqsService {
     /// Hand the engine's events to the database writer, while holding the
     /// manager so that commit order matches engine order.
     fn notify_change(&self, manager: &mut QueueManager) -> Commit {
+        let changed = manager.take_changed();
         let events = manager.drain_events();
-        let changed = !events.is_empty();
         let commit = match &self.writer {
             None => Commit::Settled(Ok(())),
             Some(writer) => match writer.submit(events, manager) {
@@ -953,6 +984,18 @@ impl SqsService {
             };
             let (messages, next_delivery) = (messages?, next_delivery?);
             if !messages.is_empty() || tokio::time::Instant::now() >= deadline {
+                // Building a large response (MD5 and JSON) takes milliseconds,
+                // ~10 ms for ten 256 KiB bodies. Without a database nothing
+                // before this awaits, so the request would run in one poll
+                // while tasks it woke wait in this worker's LIFO slot, where
+                // other workers can't steal them. Yielding first lets them
+                // run. Only for large responses: yielding on every request
+                // cost small receives ~20% on Linux. Measured in containers:
+                // 256 KiB receive and delete went from ~1,500 to ~2,500 msg/s.
+                let bytes: usize = messages.iter().map(|m| m.body.len()).sum();
+                if bytes >= YIELD_BEFORE_RESPONSE_BYTES {
+                    tokio::task::yield_now().await;
+                }
                 return Ok(
                     json!({"Messages": messages.iter().map(|m| self.received(m, &system_names, &attribute_names)).collect::<Vec<_>>()}),
                 );
@@ -1072,11 +1115,7 @@ async fn metrics(State(service): State<SqsService>) -> Response {
             format!(
                 "{{file=\"{}\",storage=\"{}\",sqs_limits=\"{}\"}}",
                 label_value(config.config_file.as_deref().unwrap_or("")),
-                if config.persistent_storage {
-                    "sqlite"
-                } else {
-                    "memory"
-                },
+                config.storage.label(),
                 if config.relaxed_limits {
                     "relaxed"
                 } else {
