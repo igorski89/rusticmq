@@ -48,10 +48,11 @@ QUIET = 15
 DISTURBED = 25
 
 
-def elastic(image):
+def elastic(image, volume_owner=None):
+    """`volume_owner` is the UID:GID that must own /data, for images that do not run as root."""
     def options(storage):
         return ["--mount", f"type=bind,source={CONF}/elasticmq-{storage}.conf,target=/opt/elasticmq.conf,readonly"]
-    return {"image": image, "options": options, "args": lambda storage: []}
+    return {"image": image, "options": options, "args": lambda storage: [], "volume_owner": volume_owner}
 
 
 def rusticmq(image, memory_args=()):
@@ -70,7 +71,10 @@ SERVERS = {
     # Not run by default: the SQLite write path without disk I/O.
     "rusticmq-sqlite-memory": rusticmq("localhost:5555/igorski89/rusticmq:0.7.0", ["--data-dir", ":memory:"]),
     "elasticmq-native": elastic("softwaremill/elasticmq-native:1.7.1"),
-    "elasticmq-jvm": elastic("softwaremill/elasticmq:1.7.1"),
+    "elasticmq-jvm": elastic("softwaremill/elasticmq:1.7.1", volume_owner="999:999"),
+    # Not run by default: the release RusticMQ follows.
+    "elasticmq-native-2.0": elastic("softwaremill/elasticmq-native:2.0.0-rc1"),
+    "elasticmq-jvm-2.0": elastic("softwaremill/elasticmq:2.0.0-rc1", volume_owner="999:999"),
 }
 STORAGES = ("memory", "durable")
 DEFAULT_SERVERS = ("rusticmq", "elasticmq-native", "elasticmq-jvm")
@@ -346,10 +350,10 @@ class Round:
             "--cpuset-cpus", GENERATOR_CPUS, LOADGEN)
         if self.storage == "durable":
             docker("volume", "create", VOLUME)
-            if self.server == "elasticmq-jvm":
-                # The JVM image runs as UID 999 but leaves /data owned by root.
+            if self.spec.get("volume_owner"):
+                # The JVM images run as UID 999 but leave /data owned by root.
                 docker("run", "--rm", "--platform", PLATFORM, "--mount", f"type=volume,source={VOLUME},target=/d",
-                    "alpine:3.20", "chown", "999:999", "/d")
+                    "alpine:3.20", "chown", self.spec["volume_owner"], "/d")
         started = time.monotonic()
         try:
             self.record("startup", startup_ms=self.start())
