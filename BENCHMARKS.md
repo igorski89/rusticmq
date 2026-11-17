@@ -128,6 +128,63 @@ seconds per 1,000 sends and 0.02 per 1,000 receives and deletes, against 0.15 an
 for native and 0.11 and 0.05 for the JVM. On durable queues it uses 0.09 and 0.04,
 against 0.22 and 0.18 for native and 0.16 and 0.13 for the JVM.
 
+## ElasticMQ 2.0.0-rc1
+
+A second run on 2026-11-13 compared the same RusticMQ 0.7.0 image with
+`softwaremill/elasticmq-native:2.0.0-rc1` and `softwaremill/elasticmq:2.0.0-rc1`
+(490 MB), on the same machine and setup. The picture is the same as against 1.7.1.
+The JVM build sends about 1.6 times as fast at 64 connections in memory, 1.8 times as
+fast at 8 durable connections, and sends FIFO messages faster. The two tie on
+concurrent receives in memory and on 64-connection durable sends. RusticMQ leads on
+single-connection sends, durable and FIFO receives, memory, disk, startup and
+crash safety.
+
+| | RusticMQ | ElasticMQ native 2.0 | ElasticMQ JVM 2.0 |
+| --- | --- | --- | --- |
+| Send, 64 connections, in memory (msg/s) | 35,458 | 27,068 | **55,081** |
+| Receive and delete, 64 connections, in memory (msg/s) | **76,096** | 54,004 | **76,796** |
+| Send, 1 connection, in memory (msg/s) | **13,658** | 2,738 | 3,625 |
+| FIFO receive and delete, 8 connections, in memory (msg/s) | **60,601** | 5,406 | 7,709 |
+| Send, 8 connections, durable (msg/s) | 11,628 | 10,994 | **21,304** |
+| Send, 64 connections, durable (msg/s) | **30,086** | 13,148 | **29,787** |
+| Receive and delete, 64 connections, durable (msg/s) | **43,707** | 8,429 | 21,789 |
+| FIFO receive and delete, 8 connections, durable (msg/s) | **19,811** | 4,442 | 6,730 |
+| p99 send latency at 5,000 msg/s, in memory (ms) | **2.83** | 5.88 | 7.13 |
+| Startup to first healthy response, in memory (ms) | **57** | 88 | 952 |
+| Memory with 1,000 waiting long polls, in memory (MiB) | **3.9** | 45 | 1,113 |
+| Memory holding 100,000 messages, in memory (MiB) | **107** | 136 | 1,114 |
+| Disk holding about 100,000 messages (MiB) | **141** | 447 | 1,350 |
+| Acknowledged sends lost after `SIGKILL`, three rounds | **0, 0, 0** | 203, 221, 558 | 6,697, 6,864, 7,461 |
+| Failed receiving 5 MiB bodies | No | No | **Yes, 5 of 6 rounds** |
+
+Medians of three rounds. Every measurement is in
+[benchmark/results/raw-elasticmq-2.0.0-rc1.jsonl](benchmark/results/raw-elasticmq-2.0.0-rc1.jsonl);
+`python3 benchmark/compare.py report --output benchmark/results/raw-elasticmq-2.0.0-rc1.jsonl`
+prints the full tables.
+
+What changed in ElasticMQ between 1.7.1 and 2.0.0-rc1, in this setup:
+
+- **Native memory dropped sharply.** 1,000 long polls take 45 MiB instead of 676,
+  and 100,000 messages 136 MiB instead of 899. Its 64-connection sends and
+  receives are 7 to 12% slower in memory and 18 to 27% slower on durable queues.
+- **Durable storage grew.** The H2 file at the backlog step is 447 MiB for native
+  (167 before) and 1,350 MiB for the JVM build (794 before).
+- **Native loses fewer messages when killed**: about 200 to 560 acknowledged
+  sends instead of 1,300 to 2,600.
+- **The JVM build loses more.** Per round it lost 6,697 to 7,461 of 6,864 to 8,529
+  acknowledged sends, 78 to 100%. 1.7.1 lost 2,288 to 2,925 of 7,653 to 9,828.
+  The kill comes at the end of the full sequence, and in every 2.0 round the 5 MiB
+  phase had already crashed and restarted the server. Killed right after sending to
+  a fresh server, both versions lost about 3%, and nothing after a 10-second wait.
+  An instrumented repeat drained the queue
+  again 30 and 90 seconds after restart and found nothing, so the messages are gone
+  rather than restored late. The likely cause is H2's background writer falling
+  behind on a large database; that was not measured.
+
+RusticMQ's own figures match the 1.7.1 run within round-to-round variation. Its
+64-connection durable receives ranged from 40,395 to 54,860 msg/s here and from
+52,140 to 59,063 there, with the same image.
+
 ## Setup
 
 - **Machine:** Apple M1 Pro, Docker Desktop VM with 10 CPUs and 23.4 GiB. No emulation.
@@ -168,9 +225,9 @@ run had a duplicate, and the only incomplete drains were the JVM failures above.
 
 - One laptop's Docker VM, whose virtual disk may treat `fsync` differently from a
   server's disk. Durable numbers in particular may not carry over.
-- RusticMQ 0.7.0 follows ElasticMQ 2.0.0-rc1, but the comparison uses 1.7.1, the
-  latest stable release, as the earlier runs did. The 2.0.0-rc1 images were not
-  measured.
+- RusticMQ 0.7.0 follows ElasticMQ 2.0.0-rc1, but the main comparison uses 1.7.1,
+  the latest stable release, as the earlier runs did. 2.0.0-rc1 is covered in its
+  own section above.
 - Receive throughput varies between rounds: RusticMQ's 64-connection in-memory
   receives ranged from 72,293 to 82,741 msg/s.
 - Memory is the cgroup's anonymous memory. A JVM's is mostly heap it has not yet handed
